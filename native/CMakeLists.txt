@@ -18,7 +18,7 @@ endif()
 
 # ---- the picture on screen: an OpenGL ES 3 renderer (the app's Surface; off screen in kp_render) ----
 if(ANDROID)
-  add_library(kepyur_render STATIC render/video_renderer.cpp)
+  add_library(kepyur_render STATIC render/video_renderer.cpp render/no_signal.cpp)
   target_link_libraries(kepyur_render PUBLIC kepyur_dsp GLESv3 EGL)
 else()
   find_package(PkgConfig QUIET)
@@ -26,7 +26,7 @@ else()
     pkg_check_modules(KP_GLES IMPORTED_TARGET QUIET egl glesv2)  # e.g. Mesa: libegl-dev libgles-dev
   endif()
   if(KP_GLES_FOUND)
-    add_library(kepyur_render STATIC render/video_renderer.cpp)
+    add_library(kepyur_render STATIC render/video_renderer.cpp render/no_signal.cpp)
     target_link_libraries(kepyur_render PUBLIC kepyur_dsp PkgConfig::KP_GLES)
   endif()
 endif()

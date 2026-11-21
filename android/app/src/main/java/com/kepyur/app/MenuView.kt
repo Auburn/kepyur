@@ -4,6 +4,7 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
 import android.text.TextUtils
@@ -29,10 +30,14 @@ data class Found(val mhz: Double, val name: String, val snrDb: Float, val std: S
 /** What the menu shows about the adapter and the radio; everything else on it is a [Settings] value. */
 data class MenuState(
     val tone: Tone = Tone.IDLE,
+    /** Over the preview's top left, beside the dot; not while the picture is [locked]. */
     val headline: String = "",
+    /** Along the top of the menu, its whole width; with this and [action] both empty, the app's name instead. */
     val detail: String = "",
     /** What tapping the status does ("Try again"); null: nothing. */
     val action: String? = null,
+    /** The picture is locked: the preview shows it, and the headline gives way to it (the dot stays). */
+    val locked: Boolean = false,
     /** The radio is up: picking a channel and scanning do something now. */
     val radioReady: Boolean = false,
     val scanning: Boolean = false,
@@ -46,9 +51,11 @@ data class MenuState(
 )
 
 /**
- * The menu: everything the app has to offer, over the blurred picture. A rail on the left (status, the four
- * tabs, Close) and the chosen tab's settings on the right. It changes [Settings] itself and tells the
- * [Listener] which kind of thing changed; it knows nothing of the radio.
+ * The menu: everything the app has to offer, over a black screen. A rail on the left (the four tabs, and at its
+ * foot the picture, small, with the status dot and headline over its top left: tapping it closes the menu), the
+ * chosen tab's settings on the right, and a line of the status's words along the top, the whole width. It changes
+ * [Settings] itself and tells the [Listener] which kind of thing changed; it knows nothing of the radio. The
+ * preview is a hole: it tells the [Listener] where it is, and the native screen draws the picture there.
  */
 @SuppressLint("ViewConstructor")
 class MenuView(ctx: Context, private val s: Settings, private val on: Listener) : FrameLayout(ctx) {
@@ -64,19 +71,29 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
         fun onSignal(retune: Boolean)
         /**
          * A view slider is being dragged ([on]) or was let go: while it is, the menu steps aside (all but that
-         * slider) so the picture can be seen changing, and the picture should be shown sharp.
+         * slider) so the picture can be seen changing, and the picture should be shown full size.
          */
         fun onPeek(on: Boolean)
         /** A finger has come down somewhere on the menu. */
         fun onTouched() {}
         fun onStatusAction()
         fun onClose()
+        /**
+         * The preview is now at [left], [top], [right], [bottom] (pixels, in the menu's own coordinates: the screen's,
+         * as the menu fills it), its corners rounded by [radius]: the picture goes there while the menu is up.
+         */
+        fun onPreview(left: Int, top: Int, right: Int, bottom: Int, radius: Float) {}
     }
 
     private var state = MenuState()
     private var tab = 0
-    private val group = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }   // rail + card
-    private lateinit var rail: View
+    private val group = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }   // status line, rail + card
+    private lateinit var rail: ViewGroup
+    private lateinit var railPanel: Panel
+    private lateinit var railContent: LinearLayout   // the rail above the preview: the tabs
+    private lateinit var preview: PreviewTile
+    private lateinit var previewBox: FrameLayout     // the preview and the status badge over it
+    private val previewAt = Rect()                   // where the listener was last told the preview is
     private lateinit var card: FrameLayout
     private val pageBodies = ArrayList<LinearLayout>()
     private val pageScrollers = ArrayList<ScrollView>()
@@ -87,12 +104,27 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
     private var cutLeft = 0    // a camera cutout's share of either end of the screen, px
     private var cutRight = 0
 
-    // rail
-    private val wordmark = label(ctx, "KEPYUR", 11f, Skin.TEXT_3, medium = true).apply { letterSpacing = 0.32f }
+    // status: the dot and the headline over the preview, the detail and the action along the top (the wordmark
+    // when there are none)
     private val dot = View(ctx)
-    private val headline = label(ctx, "", 16f, Skin.TEXT, medium = true)
-    private val detail = label(ctx, "", 12.5f, Skin.TEXT_2)
-    private val action = label(ctx, "", 12.5f, Skin.ACCENT, medium = true)
+    private val wordmark = label(ctx, "KEPYUR", 11f, Skin.TEXT_3, medium = true).apply { letterSpacing = 0.32f }
+    internal val statusTitle = label(ctx, "", 13.5f, Skin.TEXT, medium = true).apply {
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        setShadowLayer(dp(3f), 0f, dp(1f), Color.argb(200, 0, 0, 0))   // over the picture, whatever it shows
+    }
+    internal val statusDetail = label(ctx, "", 12.5f, Skin.TEXT_2).apply {
+        maxLines = 1   // a long message in full: the Signal tab
+        ellipsize = TextUtils.TruncateAt.END
+    }
+    internal val statusAction = label(ctx, "", 12.5f, Skin.ACCENT, medium = true)
+    internal val statusRow = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.TOP
+        setOnClickListener { if (state.action != null) on.onStatusAction() }
+    }
+
+    // rail
     private val tabNames = listOf("Channel", "View", "Picture", "Signal")
     private val tabViews = ArrayList<TextView>()
     private val pages = ArrayList<View>()
@@ -133,12 +165,12 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
     )
 
     init {
-        setBackgroundColor(Skin.SCRIM)
+        // no background: behind the menu the screen is black but for the picture in the preview
         isClickable = true   // touches stop here: nothing behind the menu reacts
         rail = buildRail()
-        rail.background = rounded(Skin.PANEL, dp(22f), Skin.STROKE, dpi(1f))
-        rail.setPadding(dpi(8f), dpi(10f), dpi(8f), dpi(8f))
-        group.addView(rail, LinearLayout.LayoutParams(dpi(RAIL_DP), -1))
+        railPanel = Panel(Skin.PANEL, dp(22f), Skin.STROKE, dp(1f))
+        rail.background = railPanel
+        rail.setPadding(dpi(8f), dpi(8f), dpi(8f), dpi(8f))
         card = FrameLayout(ctx).apply {
             background = rounded(Skin.PANEL, dp(22f), Skin.STROKE, dpi(1f))
             clipToOutline = true
@@ -148,7 +180,17 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
         pages += scrolling(buildPicturePage())
         pages += scrolling(buildSignalPage())
         for (p in pages) card.addView(p, LayoutParams(-1, -1))
-        group.addView(card, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dpi(12f) })
+        // along the top, the whole width: a line of the status's words, in from either end as far as the tabs' and
+        // the card's words are; under it the rail and the card
+        statusRow.setPadding(dpi(22f), 0, dpi(22f), 0)
+        statusRow.addView(wordmark, LinearLayout.LayoutParams(-2, -2))
+        statusRow.addView(statusDetail, LinearLayout.LayoutParams(0, -2, 1f))
+        statusRow.addView(statusAction, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dpi(14f) })
+        group.addView(statusRow, LinearLayout.LayoutParams(-1, dpi(STATUS_ROW_DP)))
+        val body = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        body.addView(rail, LinearLayout.LayoutParams(dpi(RAIL_DP), -1))
+        body.addView(card, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dpi(12f) })
+        group.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
         addView(group, LayoutParams(-1, -1, Gravity.CENTER))
         setOnApplyWindowInsetsListener { _, insets ->
             // keep clear of a camera cutout at either end (the picture runs under it, the menu does not)
@@ -170,7 +212,7 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
     override fun dispatchTouchEvent(e: MotionEvent): Boolean {
         if (e.actionMasked == MotionEvent.ACTION_DOWN) on.onTouched()
         // While a slider is held and the rest has faded away, what cannot be seen must not be pressed: a second
-        // finger (a thumb resting where Close menu was) goes nowhere.
+        // finger (a thumb resting where the preview was) goes nowhere.
         if (peeking != null && e.actionMasked == MotionEvent.ACTION_POINTER_DOWN) return true
         return super.dispatchTouchEvent(e)
     }
@@ -183,43 +225,46 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
         val lp = group.layoutParams
         lp.width = min(MeasureSpec.getSize(w), dpi(1010f))
         lp.height = min(MeasureSpec.getSize(h), dpi(470f))
-        // the margin round the menu: less of it on a short screen, where every line of the status counts
+        // the margin round the menu (the status's line inside it at the top): less of it on a short screen, where
+        // every line counts, and above and below a third less again than at the sides
         val base = dpi(if (lp.height < dpi(SHORT_DP)) 12f else 18f)
-        group.setPadding(max(base, cutLeft + dpi(8f)), base, max(base, cutRight + dpi(8f)), base)
-        val cardHeight = lp.height - group.paddingTop - group.paddingBottom
-        fitRail(cardHeight - rail.paddingTop - rail.paddingBottom)
+        val ends = (base * VERTICAL_MARGIN).roundToInt()
+        group.setPadding(max(base, cutLeft + dpi(8f)), ends, max(base, cutRight + dpi(8f)), ends)
+        val cardHeight = lp.height - group.paddingTop - group.paddingBottom - dpi(STATUS_ROW_DP)
+        val railHeight = cardHeight - rail.paddingTop - rail.paddingBottom
+        fitRail(railHeight)
+        fitPreview(railHeight)
         val tileHeight = ((cardHeight - dpi(CHANNEL_PAGE_REST)) / 2).coerceIn(dpi(56f), dpi(84f))
         for (r in tileRows) r.layoutParams.height = tileHeight
         super.onMeasure(w, h)
     }
 
+    /**
+     * The rail's panel leaves the preview open, and the listener hears where it is (the picture is drawn there).
+     * Whatever moved it (another aspect ratio, another screen), this runs after it.
+     */
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(changed, l, t, r, b)
+        val inRail = Rect(0, 0, preview.width, preview.height)
+        rail.offsetDescendantRectToMyCoords(preview, inRail)
+        railPanel.hole.set(inRail)
+        railPanel.holeRadius = preview.radius
+        railPanel.invalidateSelf()
+        val at = Rect(0, 0, preview.width, preview.height)
+        offsetDescendantRectToMyCoords(preview, at)
+        if (at != previewAt) {
+            previewAt.set(at)
+            on.onPreview(at.left, at.top, at.right, at.bottom, preview.radius)
+        }
+    }
+
     // ------------------------------------------------------------------------------------------ rail
-    private fun buildRail(): View {
-        // Close menu is always there, at the bottom; what is above it gives way on a short screen (onMeasure
-        // trims the status and the tabs to fit) and, should even that not be enough, scrolls.
+    private fun buildRail(): ViewGroup {
+        // The tabs at the top, the preview always at the bottom, in place of a Close button; should the tabs not
+        // fit above it on some very short screen, they scroll.
         val whole = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         val rail = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        rail.addView(wordmark, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dpi(14f); topMargin = dpi(4f) })
-
-        val status = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dpi(14f), dpi(10f), dpi(8f), dpi(10f))
-            setOnClickListener { if (state.action != null) on.onStatusAction() }
-        }
-        val first = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        dot.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Skin.TEXT_3) }
-        first.addView(dot, LinearLayout.LayoutParams(dpi(8f), dpi(8f)).apply { marginEnd = dpi(8f) })
-        headline.maxLines = 1
-        headline.ellipsize = TextUtils.TruncateAt.END
-        first.addView(headline, LinearLayout.LayoutParams(0, -2, 1f))
-        status.addView(first)
-        detail.maxLines = 4
-        detail.ellipsize = TextUtils.TruncateAt.END
-        detail.setLineSpacing(dp(2f), 1f)
-        status.addView(detail, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dpi(6f) })
-        status.addView(action, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dpi(6f) })
-        rail.addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dpi(6f) })
-
+        railContent = rail
         for ((i, name) in tabNames.withIndex()) {
             val t = label(context, name, 15f, Skin.TEXT_2).apply {
                 gravity = Gravity.CENTER_VERTICAL
@@ -228,7 +273,7 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
                 setOnClickListener { showTab(i) }
             }
             tabViews += t
-            rail.addView(t, LinearLayout.LayoutParams(-1, dpi(42f)).apply { topMargin = if (i == 0) dpi(6f) else dpi(2f) })
+            rail.addView(t, LinearLayout.LayoutParams(-1, dpi(42f)).apply { topMargin = if (i == 0) 0 else dpi(2f) })
         }
         val above = ScrollView(context).apply {
             isVerticalScrollBarEnabled = false
@@ -236,27 +281,42 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
             addView(rail, ViewGroup.LayoutParams(-1, -2))
         }
         whole.addView(above, LinearLayout.LayoutParams(-1, 0, 1f))
-        whole.addView(PillButton(context, "Close menu", primary = true).apply { setOnClickListener { on.onClose() } },
-            LinearLayout.LayoutParams(-1, dpi(46f)).apply { topMargin = dpi(8f) })
+
+        // the preview, with the status dot and headline over its top left (a finger there still closes the menu)
+        val box = FrameLayout(context)
+        previewBox = box
+        preview = PreviewTile(context).apply { setOnClickListener { on.onClose() } }
+        box.addView(preview, LayoutParams(-1, -1))
+        val badge = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        dot.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Skin.TEXT_3) }
+        badge.addView(dot, LinearLayout.LayoutParams(dpi(8f), dpi(8f)))
+        badge.addView(statusTitle, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dpi(7f) })
+        box.addView(badge, LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+            topMargin = dpi(10f)
+            marginEnd = dpi(11f)
+            marginStart = dpi(11f)
+        })
+        whole.addView(box, LinearLayout.LayoutParams(-1, dpi(PREVIEW_MIN_DP)).apply { topMargin = dpi(PREVIEW_GAP_DP) })
         return whole
     }
 
-    /**
-     * The rail on a screen [height] px tall inside its padding: lower tabs when it is short, and the status
-     * message cut to the lines there is room for, so that the tabs and Close menu always fit.
-     */
+    /** The rail on a screen [height] px tall inside its padding: lower tabs when it is short. */
     private fun fitRail(height: Int) {
-        val short = height < dpi(SHORT_DP - 40f)
-        // a problem with something to tap, on a short screen: its message is worth more than the name of the app
-        val tight = short && state.action != null
-        wordmark.visibility = if (tight) View.GONE else View.VISIBLE
-        val tab = dpi(if (tight) 34f else if (short) 36f else 42f)
+        val tab = dpi(if (height < dpi(SHORT_DP - 40f)) 36f else 42f)
         for (t in tabViews) if (t.layoutParams.height != tab) t.layoutParams.height = tab
-        // the wordmark, the headline with the status block's padding, the tabs with their gaps, the button
-        val rest = (if (tight) 0 else dpi(18f)) + dpi(46f) + dpi(12f) + 4 * tab + dpi(54f)
-        val forAction = if (state.action != null) dpi(23f) else 0
-        val lines = ((height - rest - forAction - dpi(6f)) / dpi(17f)).coerceIn(1, 4)
-        if (detail.maxLines != lines) detail.maxLines = lines
+    }
+
+    /**
+     * The preview takes whatever height of the rail ([height] px inside its padding) the tabs leave, up to the
+     * picture's own shape at the rail's width, and no less than [PREVIEW_MIN_DP].
+     */
+    private fun fitPreview(height: Int) {
+        val width = dpi(RAIL_DP) - rail.paddingLeft - rail.paddingRight
+        railContent.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED))
+        val least = dpi(PREVIEW_MIN_DP)
+        val most = max(least, (width / s.aspect).roundToInt())
+        val tile = (height - railContent.measuredHeight - dpi(PREVIEW_GAP_DP)).coerceIn(least, most)
+        if (previewBox.layoutParams.height != tile) previewBox.layoutParams.height = tile
     }
 
     fun showTab(index: Int, animate: Boolean = true) {
@@ -335,6 +395,7 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
         peeking = row
         val to = if (row == null) 1f else 0f
         rail.animate().alpha(to).setDuration(PEEK_MS).start()
+        statusRow.animate().alpha(to).setDuration(PEEK_MS).start()
         // the page that is faded is the one the row is on, whatever tab is showing by the time it comes back
         val body = (if (row != null) pageBodies[tab] else peekBody) ?: pageBodies[tab]
         peekBody = if (row != null) body else null
@@ -355,9 +416,8 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
             duration = PEEK_MS
             addUpdateListener {
                 peekShade = it.animatedValue as Int
-                this@MenuView.background.alpha = peekShade
                 card.background.alpha = peekShade
-                rail.background?.alpha = peekShade
+                railPanel.alpha = peekShade
             }
             start()
         }
@@ -437,7 +497,11 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
     private fun buildViewPage(): View {
         val p = page()
         p.addView(SettingRow(context, "Aspect ratio", "How the camera's picture is shaped",
-            Segmented(context, listOf("4:3", "16:9"), if (s.wide) 1 else 0) { i -> s.wide = i == 1; changedView() }
+            Segmented(context, listOf("4:3", "16:9"), if (s.wide) 1 else 0) { i ->
+                s.wide = i == 1
+                requestLayout()   // the preview takes the picture's shape
+                changedView()
+            }
                 .sized(dpi(150f))))
         p.addView(divider(context))
         fitRow = SettingRow(context, "Scaling", fitWords[s.fit],
@@ -590,6 +654,13 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
         /** A screen lower than this is short: most phones held sideways are, by a little. */
         const val SHORT_DP = 400f
         const val PEEK_MS = 150L
+        /** The preview is no lower than this (dp), and sits at least this far below the tabs. */
+        const val PREVIEW_MIN_DP = 64f
+        const val PREVIEW_GAP_DP = 8f
+        /** Along the top, the whole width: one line of the status's words, with a gap under it (dp). */
+        const val STATUS_ROW_DP = 24f
+        /** The margin above and below the menu, against the one at its sides. */
+        const val VERTICAL_MARGIN = 0.65f
         /** Height (dp) of everything on the channel page but its two rows of tiles, paddings included. */
         const val CHANNEL_PAGE_REST = 168f
     }
@@ -606,15 +677,16 @@ class MenuView(ctx: Context, private val s: Settings, private val on: Listener) 
             Tone.ERROR -> Skin.ERROR
             Tone.IDLE -> Skin.TEXT_3
         })
-        if (headline.text.toString() != st.headline) headline.text = st.headline
-        if (detail.text.toString() != st.detail) detail.text = st.detail
-        detail.visibility = if (st.detail.isEmpty()) View.GONE else View.VISIBLE
-        action.text = st.action ?: ""
-        val actionShown = if (st.action == null) View.GONE else View.VISIBLE
-        if (action.visibility != actionShown) {
-            action.visibility = actionShown
-            requestLayout()   // the room for the message changes with it (fitRail)
-        }
+        // a locked picture speaks for itself: over it only the dot
+        if (statusTitle.text.toString() != st.headline) statusTitle.text = st.headline
+        statusTitle.visibility = if (st.locked || st.headline.isEmpty()) View.GONE else View.VISIBLE
+        // nothing to say: the name of the app in its place (an action alone keeps its place at the end)
+        val quiet = st.detail.isEmpty() && st.action == null
+        wordmark.visibility = if (quiet) View.VISIBLE else View.GONE
+        if (statusDetail.text.toString() != st.detail) statusDetail.text = st.detail
+        statusDetail.visibility = if (quiet) View.GONE else if (st.detail.isEmpty()) View.INVISIBLE else View.VISIBLE
+        statusAction.text = st.action ?: ""
+        statusAction.visibility = if (st.action == null) View.GONE else View.VISIBLE
 
         scanButton.isEnabled = st.radioReady && !st.scanning
         scanButton.text = if (st.scanning) "Scanning" else "Scan"

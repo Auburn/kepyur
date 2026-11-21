@@ -211,6 +211,9 @@ class FakeEngine : Engine {
         rec("setView", aspect, fit, scale, stereo, eyeShift)
 
     @Synchronized override fun setBackdrop(on: Boolean, now: Boolean) = rec("setBackdrop", on, now)
+    @Synchronized override fun setCardLabel(label: String) = rec("setCardLabel", label)
+    @Synchronized override fun setPreview(left: Int, top: Int, right: Int, bottom: Int, radius: Float) =
+        rec("setPreview", left, top, right, bottom, radius)
     @Synchronized override fun record(seconds: Double, prefix: String) = rec("record", seconds, prefix)
     @Synchronized override fun setSurface(surface: Surface?) = rec("setSurface", surface != null)
     @Synchronized override fun redraw() = rec("redraw")

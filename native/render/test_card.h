@@ -1,5 +1,5 @@
 // kepyur: a test picture, for looking at the screen side of the app without a transmitter (the app's
-// "testcard" extra) and for kp_render. A sky-to-ground gradient with a grid, so blur and scaling are easy to
+// "testcard" extra) and for kp_render. A sky-to-ground gradient with a grid, so sharpness and scaling are easy to
 // judge; a circle as a 4:3 camera would see one (round only when the picture is shown at 4:3); a red line
 // around the very edge (what a crop cuts off); and a bar that moves with `tick`, so a frozen picture shows.
 #pragma once

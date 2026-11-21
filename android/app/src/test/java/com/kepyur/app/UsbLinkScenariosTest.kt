@@ -103,7 +103,7 @@ class UsbLinkScenariosTest : AppHarness() {
     @Test
     fun wedgedRadioIsReopenedAtOnceQuietlyAndTunedAgain() {
         running()
-        click(pill("Close menu"))
+        click(preview())
         advance(500)
         assertEquals(View.GONE, menu.visibility)
         fake.wedged = true

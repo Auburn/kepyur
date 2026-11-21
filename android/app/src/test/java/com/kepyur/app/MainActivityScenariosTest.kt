@@ -1,5 +1,6 @@
 package com.kepyur.app
 
+import android.view.SurfaceView
 import android.view.View
 import com.kepyur.app.FakeEngine.Call
 import com.kepyur.app.UsbLink.State
@@ -29,7 +30,7 @@ class MainActivityScenariosTest : AppHarness() {
     }
 
     /** The engine calls that change something, since the last [FakeEngine.clearCalls]. */
-    private fun changes() = fake.radioCalls().filter { it.name !in setOf("setSurface", "redraw", "superspeed") }
+    private fun changes() = fake.radioCalls().filter { it.name !in setOf("setSurface", "redraw", "superspeed", "setPreview") }
 
     private fun assertChanges(vararg expected: Call) = assertEquals(expected.toList(), changes())
 
@@ -67,6 +68,7 @@ class MainActivityScenariosTest : AppHarness() {
         assertEquals(1, fake.count("open"))
         assertEquals(listOf(call("scan", 0.0)), fake.calls("scan"))
         assertEquals(0, fake.count("watch"))
+        assertEquals("no channel yet: the card says NO SIGNAL", call("setCardLabel", ""), fake.last("setCardLabel"))
         advance(300)
         assertEquals("Scanning", headline)
 
@@ -77,6 +79,7 @@ class MainActivityScenariosTest : AppHarness() {
         assertEquals('R', s.band)
         assertTrue(headline, headline.contains("R4") && headline.contains("5769"))
         assertTrue(tile("R4").chosen)
+        assertEquals("the card names the channel the scan chose", call("setCardLabel", "R4"), fake.last("setCardLabel"))
     }
 
     @Test
@@ -96,6 +99,7 @@ class MainActivityScenariosTest : AppHarness() {
     @Test
     fun savedChannelIsWatchedAtOnceWithoutAScan() {
         running()
+        assertEquals("the card names the saved channel", listOf(call("setCardLabel", "F2")), fake.calls("setCardLabel"))
         assertEquals(listOf(call("watch", f2, true)), fake.calls("watch"))
         assertEquals(0, fake.count("scan"))
         assertTrue(headline, headline.contains("F2") && headline.contains("5760"))
@@ -107,7 +111,7 @@ class MainActivityScenariosTest : AppHarness() {
         launch()
         advance(300)
         fake.clearCalls()
-        click(pill("Close menu"))
+        click(preview())
         assertTrue(changes().toString(), call("setBackdrop", false, false) in changes())
         looper.idleFor(Duration.ofMillis(300))
         assertEquals(View.GONE, menu.visibility)
@@ -131,7 +135,7 @@ class MainActivityScenariosTest : AppHarness() {
         assertEquals(1f, menu.alpha, 0.01f)
 
         // Back from the picture: the menu
-        click(pill("Close menu"))
+        click(preview())
         looper.idleFor(Duration.ofMillis(300))
         @Suppress("DEPRECATION") activity.onBackPressed()
         settle()
@@ -146,12 +150,51 @@ class MainActivityScenariosTest : AppHarness() {
     @Test
     fun menuReopenedWhileItIsStillClosingStaysOpen() {
         launch()
-        click(pill("Close menu"))
+        click(preview())
         looper.idleFor(Duration.ofMillis(50))   // the 200 ms fade is under way
         @Suppress("DEPRECATION") activity.onBackPressed()
         looper.idleFor(Duration.ofMillis(600))
         assertEquals(View.VISIBLE, menu.visibility)
         assertEquals(1f, menu.alpha, 0.01f)
+    }
+
+    /** The picture goes where the preview is: its place on the Surface, told to the native screen as it is laid out. */
+    @Test
+    fun thePreviewTellsTheScreenWhereThePictureGoes() {
+        launch()
+        advance(300)
+        layOut()
+        val tile = preview()
+        val video = views().filterIsInstance<SurfaceView>().single()
+        val t = IntArray(2).also { tile.getLocationInWindow(it) }
+        val v = IntArray(2).also { video.getLocationInWindow(it) }
+        val told = fake.last("setPreview") ?: return fail("the screen was never told where the preview is: ${fake.radioCalls()}")
+        assertEquals(listOf(t[0] - v[0], t[1] - v[1], t[0] - v[0] + tile.width, t[1] - v[1] + tile.height), told.args.take(4))
+        assertEquals(tile.radius, told.args[4] as Float, 0.01f)
+        assertTrue("a preview to see: ${tile.width} x ${tile.height}",
+            tile.width > 0 && tile.height >= tile.dpi(MenuView.PREVIEW_MIN_DP))
+
+        // a 16:9 camera: the preview is never taller than that shape, and the screen hears where it is now
+        showTab("View")
+        pick(control("Aspect ratio") as Segmented, 1, 2)
+        layOut()
+        assertTrue("${tile.width} x ${tile.height}", tile.height <= tile.width * 9 / 16 + 1)
+        tile.getLocationInWindow(t)
+        assertEquals(t[1] - v[1] + tile.height, fake.last("setPreview")!!.args[3])
+    }
+
+    /** Over the preview the dot and the headline; once the picture locks, only the dot (the words stay at the foot). */
+    @Test
+    fun theHeadlineGivesWayToALockedPicture() {
+        running()
+        assertTrue(headline, headline.contains("F2") && headline.contains("5760"))
+        fake.locked = true
+        advance(500)
+        assertEquals("locked: nothing over the picture but the dot", "", headline)
+        assertTrue(detail, detail.contains("fps"))
+        fake.locked = false
+        advance(500)
+        assertTrue("the picture lost: the headline is back ($headline)", headline.contains("F2"))
     }
 
     @Test
@@ -359,7 +402,7 @@ class MainActivityScenariosTest : AppHarness() {
         layOut()
         fake.clearCalls()
         click(tile("F4"))
-        assertChanges(call("watch", 5800e6, true))
+        assertChanges(call("setCardLabel", "F4"), call("watch", 5800e6, true))   // the card names it before the picture goes
         assertEquals(5800, savedSettings().channelMhz)
         assertEquals('F', savedSettings().band)
         assertTrue(tile("F4").chosen)
@@ -520,7 +563,7 @@ class MainActivityScenariosTest : AppHarness() {
         repeat(3) { fake.rawStatus += bad }
         advance(1000)
         assertEquals(State.RUNNING, link.state)
-        assertTrue(headline, headline.contains("F2"))
+        assertTrue(detail, detail.contains("fps"))
     }
 
     /** A pilot whose frequency came out as nan (the scan's measurement, not the app's): no crash. */

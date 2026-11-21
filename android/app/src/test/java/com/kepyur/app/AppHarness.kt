@@ -234,23 +234,23 @@ abstract class AppHarness {
         return out
     }
 
-    /** The menu's status block on the rail: (headline, detail, action), as shown. */
-    private fun statusBlock(): LinearLayout {
-        val brand = views(menu).filterIsInstance<TextView>().first { it.text.toString() == "KEPYUR" }
-        return (brand.parent as LinearLayout).getChildAt(1) as LinearLayout
-    }
+    /** The menu's status, as shown: the headline over the preview, the detail and the action along the foot. */
+    private fun shown(v: TextView) = if (v.visibility == View.VISIBLE) v.text.toString() else ""
 
-    val headline: String get() = ((statusBlock().getChildAt(0) as LinearLayout).getChildAt(1) as TextView).text.toString()
-    val detail: String get() = (statusBlock().getChildAt(1) as TextView).let { if (it.visibility == View.VISIBLE) it.text.toString() else "" }
-    val action: String get() = (statusBlock().getChildAt(2) as TextView).let { if (it.visibility == View.VISIBLE) it.text.toString() else "" }
+    val headline: String get() = shown(menu.statusTitle)
+    val detail: String get() = shown(menu.statusDetail)
+    val action: String get() = shown(menu.statusAction)
 
     /** A tap on the status, as the user does to retry. */
     fun tapStatus() {
-        statusBlock().performClick()
+        menu.statusRow.performClick()
         settle()
     }
 
     fun pill(text: String): PillButton = views(menu).filterIsInstance<PillButton>().first { it.text.toString() == text }
+
+    /** The picture, small, at the foot of the rail: tapping it closes the menu. */
+    fun preview(): PreviewTile = views(menu).filterIsInstance<PreviewTile>().single()
 
     fun tab(name: String): TextView = views(menu).filterIsInstance<TextView>().first { it.text.toString() == name && it.isClickable }
 

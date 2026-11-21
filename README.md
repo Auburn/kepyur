@@ -19,9 +19,12 @@ locally built kepyur is installed, uninstall it first (`adb uninstall com.kepyur
 
 ## The app
 
-The picture fills the screen and the menu lies over it, with the picture blurred behind. The menu is open
-when the app starts; **Close menu** leaves nothing on screen but the picture. A tap on the picture brings up
-a **MENU** button (bottom centre) for three seconds; Back does the same.
+The picture fills the screen. The menu lies over a black screen, with the picture moved into a small preview
+at the foot of its left-hand column; the menu is open when the app starts. Tapping the preview closes the menu
+and leaves nothing on screen but the picture. A tap on the picture brings up a **MENU** button (bottom centre)
+for three seconds; Back does the same. Where there is no picture (no adapter, a scan, a channel with nothing on
+it, a picture that has stopped), full size or in the preview, colour bars show the chosen channel (**R8**), or
+**NO SIGNAL** before one has been chosen.
 
 - **Channel** — the band (Raceband, Fatshark, Boscam A / B / E, Lowband) and its eight channels. **Scan** is
   optional: it sweeps every band, marks the channels with video on them and tunes the strongest (or the one
@@ -82,8 +85,8 @@ On screen: the OSD pill (channel, frequency, SNR, decode → screen latency) can
   finding. No hardware.
 - `native/radio/` — the adapter (wifi-sdr `Receiver`) + a DSP thread: scan, watch, stream test; antenna
   combining (`combine.cpp`).
-- `native/render/` — the picture on screen (OpenGL ES 3): layout, side-by-side view, the menu's blurred
-  backdrop.
+- `native/render/` — the picture on screen (OpenGL ES 3): layout, side-by-side view, the menu's preview,
+  the NO SIGNAL card.
 - `native/jni/` — the app's native side; a render thread draws each frame on the video Surface as it is decoded.
 - `native/tools/` — desktop: `kp_replay` (recordings), `kp_live` (adapter on this PC), `kp_sim` (kp_live
   against a recording played back as a tunable adapter), `kp_gen` (a synthetic transmitter: recordings to
@@ -150,7 +153,8 @@ build/desktop/kp_replay rec/r4.cs16 --luma-comb --adaptive --smooth --repair   #
 KP_SIM_FILE=rec/r4.cs16 build/desktop/kp_sim --scan --offset-tune --diversity   # the radio's switches, no hardware
 KP_SIM_FILE=rec/r4.cs16 KP_SIM_DROP_EVERY=700 build/desktop/kp_sim --watch 5769   # a link that loses every 700th block: falls back to 20 MS/s (after the 10 s grace)
 KP_SIM_FILE=rec/r4.cs16 build/desktop/kp_sim --watch 5769 --msps 20               # watch at 20 MS/s (kp_live takes --msps too)
-build/desktop/kp_render out.ppm --view 2400x1080 --aspect 16:9 --fit crop --stereo --blur 1   # what a view setting draws
+build/desktop/kp_render out.ppm --view 2400x1080 --aspect 16:9 --fit crop --stereo   # what a view setting draws
+build/desktop/kp_render out.ppm --nofeed --label R8 --inset 1 --box 68,722,493,289 --radius 37   # no picture on R8, in the menu's preview
 build/desktop/kp_replay ../vtx-spike/rec/demo.cs16            # lock numbers
 build/desktop/kp_replay ../vtx-spike/rec/r4.cs16 --cnr 8      # with noise added (CNR in an 18 MHz channel)
 build/desktop/kp_replay ../vtx-spike/rec/r4.cs16 --frames | ffplay -f rawvideo -pixel_format rgb0 -video_size 720x480 -i -

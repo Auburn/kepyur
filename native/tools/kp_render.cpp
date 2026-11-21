@@ -2,10 +2,15 @@
 // without a phone. Needs EGL + OpenGL ES 3 (Mesa's software renderer will do).
 //
 //   kp_render OUT.ppm [--in FRAME.rgbx --size 720x480] [--view 2400x1080] [--aspect 4:3|16:9]
-//             [--fit fit|stretch|crop] [--scale 1.0] [--stereo] [--eye 0.0] [--blur 0..1] [--gain 1]
+//             [--fit fit|stretch|crop] [--scale 1.0] [--stereo] [--eye 0.0] [--gain 1] [--nofeed] [--label R8]
+//             [--inset 0..1 --box X,Y,W,H --radius R]
 //
 // FRAME.rgbx is one frame as kp_replay --frames writes them (the last 720 x H x 4 bytes of its output);
 // without --in the test card is drawn (test_card.h: a circle shows the aspect ratio, a border what is cut off).
+// --nofeed: no frame at all, what the screen shows then (NO SIGNAL, or with --label R8 the chosen channel);
+// --gain below 1 cross-fades a frame into it.
+// --inset 1 with --box: the picture in the menu's preview at X,Y (W x H pixels, corners of radius R); between 0
+// and 1, on its way there.
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -35,12 +40,15 @@ bool pair_of(const char *s, char sep, double &a, double &b) {
 int main(int argc, char **argv) {
   if (argc < 2) {
     std::fprintf(stderr, "usage: kp_render OUT.ppm [--in F.rgbx --size WxH] [--view WxH] [--aspect 4:3] "
-                         "[--fit fit|stretch|crop] [--scale S] [--stereo] [--eye E] [--blur B] [--gain G]\n");
+                         "[--fit fit|stretch|crop] [--scale S] [--stereo] [--eye E] [--gain G] [--nofeed] [--label L] "
+                         "[--inset T --box X,Y,W,H --radius R]\n");
     return 2;
   }
   const std::string out = argv[1];
   std::string in;
   int fw = 720, fh = 480, vw = 2400, vh = 1080;
+  bool feed = true;
+  std::string label;
   kp::ViewOpts o;
   for (int i = 2; i < argc; i++) {
     const std::string k = argv[i];
@@ -56,9 +64,17 @@ int main(int argc, char **argv) {
     } else if (k == "--scale") o.scale = static_cast<float>(std::atof(v()));
     else if (k == "--stereo") o.stereo = true;
     else if (k == "--eye") o.eye_shift = static_cast<float>(std::atof(v()));
-    else if (k == "--blur") o.blur = static_cast<float>(std::atof(v()));
     else if (k == "--gain") o.gain = static_cast<float>(std::atof(v()));
-    else {
+    else if (k == "--nofeed") feed = false;
+    else if (k == "--label") label = v();
+    else if (k == "--inset") o.inset = static_cast<float>(std::atof(v()));
+    else if (k == "--radius") o.radius = static_cast<float>(std::atof(v()));
+    else if (k == "--box") {
+      float b[4];
+      if (std::sscanf(v(), "%f,%f,%f,%f", &b[0], &b[1], &b[2], &b[3]) != 4)
+        return std::fprintf(stderr, "--box takes X,Y,W,H\n"), 2;
+      o.box = {b[0], b[1], b[2], b[3]};
+    } else {
       std::fprintf(stderr, "unknown or bad option %s\n", k.c_str());
       return 2;
     }
@@ -110,7 +126,8 @@ int main(int argc, char **argv) {
 
   kp::VideoRenderer r;
   if (!r.init()) return std::fprintf(stderr, "renderer init failed\n"), 1;
-  r.upload(frame.data(), fw, fh);
+  r.set_card_words(label);
+  if (feed) r.upload(frame.data(), fw, fh);
   r.draw(fbo, vw, vh, o);
   if (const GLenum e = glGetError(); e != GL_NO_ERROR) std::fprintf(stderr, "GL error 0x%x\n", e);
 

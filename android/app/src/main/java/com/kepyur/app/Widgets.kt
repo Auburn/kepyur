@@ -6,9 +6,14 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.Outline
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.util.TypedValue
@@ -21,17 +26,16 @@ import android.widget.TextView
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/** The menu's look: white on a dark blurred picture, one accent colour. */
+/** The menu's look: white on dark panels over a black screen, one accent colour. */
 object Skin {
     val ACCENT = Color.rgb(61, 220, 180)
     val TEXT = Color.argb(242, 255, 255, 255)
-    val TEXT_2 = Color.argb(194, 255, 255, 255)   // what explains: 4.5:1 or better over the panel on a bright picture
+    val TEXT_2 = Color.argb(194, 255, 255, 255)   // what explains
     val TEXT_3 = Color.argb(150, 255, 255, 255)   // what merely labels
     val FILL = Color.argb(22, 255, 255, 255)
     val FILL_STRONG = Color.argb(40, 255, 255, 255)
     val STROKE = Color.argb(30, 255, 255, 255)
-    val PANEL = Color.argb(92, 8, 10, 13)
-    val SCRIM = Color.argb(84, 0, 0, 0)
+    val PANEL = Color.rgb(20, 22, 26)
     val ON_LIGHT = Color.rgb(16, 18, 22)   // text on a white control
     val WARN = Color.rgb(255, 182, 72)
     val ERROR = Color.rgb(255, 112, 112)
@@ -94,6 +98,100 @@ class PillButton(ctx: Context, text: String, private val primary: Boolean = fals
         val ripple = ColorStateList.valueOf(if (primary) Color.argb(60, 0, 0, 0) else Color.argb(50, 255, 255, 255))
         background = RippleDrawable(ripple, shape, rounded(Color.WHITE, r))
         setTextColor(if (primary) Skin.ON_LIGHT else if (isEnabled) Skin.TEXT else Skin.TEXT_3)
+    }
+}
+
+/**
+ * A panel of the menu: [fill] with rounded corners and a hairline round it, less a [hole] where it has one (the
+ * rail, round the preview: the picture under the menu shows through it).
+ */
+class Panel(private val fill: Int, private val radius: Float, private val stroke: Int, private val strokeWidth: Float) : Drawable() {
+    /** The hole, in the same pixels as the bounds; empty: none. */
+    val hole = RectF()
+    var holeRadius = 0f
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+    private val box = RectF()
+    private var shade = 255
+
+    override fun draw(c: Canvas) {
+        box.set(bounds)
+        path.rewind()
+        path.fillType = Path.FillType.EVEN_ODD
+        path.addRoundRect(box, radius, radius, Path.Direction.CW)
+        if (!hole.isEmpty) path.addRoundRect(hole, holeRadius, holeRadius, Path.Direction.CW)
+        paint.style = Paint.Style.FILL
+        paint.color = fill
+        paint.alpha = Color.alpha(fill) * shade / 255
+        c.drawPath(path, paint)
+        val half = strokeWidth / 2
+        box.inset(half, half)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = strokeWidth
+        paint.color = stroke
+        paint.alpha = Color.alpha(stroke) * shade / 255
+        c.drawRoundRect(box, radius - half, radius - half, paint)
+    }
+
+    override fun getOutline(outline: Outline) = outline.setRoundRect(bounds, radius)
+    override fun setAlpha(alpha: Int) {
+        if (alpha != shade) { shade = alpha; invalidateSelf() }
+    }
+    override fun getAlpha() = shade
+    override fun setColorFilter(filter: ColorFilter?) { paint.colorFilter = filter; invalidateSelf() }
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+/**
+ * The picture, small, at the foot of the menu's rail: a hole the native screen draws the picture into (or NO
+ * SIGNAL), with nothing of its own but a hairline and the sign of a full-screen button. Tapping it closes the menu.
+ */
+class PreviewTile(ctx: Context) : View(ctx) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val box = RectF()
+    /** Its corners' radius: the rail's less the rail's padding, so that the two curves run side by side. */
+    val radius: Float get() = dp(RADIUS_DP)
+
+    init {
+        isClickable = true
+        isFocusable = true
+        contentDescription = "Close menu"
+        foreground = RippleDrawable(ColorStateList.valueOf(Color.argb(60, 255, 255, 255)), null, rounded(Color.WHITE, dp(RADIUS_DP)))
+    }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val half = dp(0.5f)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(1f)
+        paint.color = Color.argb(46, 255, 255, 255)
+        box.set(half, half, w - half, h - half)
+        c.drawRoundRect(box, radius - half, radius - half, paint)
+        // bottom right, on a dark disc: four corners of a square pointing out
+        val r = dp(13f)
+        val cx = w - dp(8f) - r
+        val cy = h - dp(8f) - r
+        paint.style = Paint.Style.FILL
+        paint.color = Color.argb(150, 10, 12, 15)
+        c.drawCircle(cx, cy, r, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(1.6f)
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.color = Color.WHITE
+        val a = dp(4.5f)
+        val arm = dp(2.8f)
+        for (sx in intArrayOf(-1, 1)) for (sy in intArrayOf(-1, 1)) {
+            val x = cx + sx * a
+            val y = cy + sy * a
+            c.drawLine(x, y, x - sx * arm, y, paint)
+            c.drawLine(x, y, x, y - sy * arm, paint)
+        }
+    }
+
+    companion object {
+        const val RADIUS_DP = 14f
     }
 }
 

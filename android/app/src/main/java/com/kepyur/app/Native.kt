@@ -35,8 +35,15 @@ interface Engine {
     fun setPicture(lumaComb: Boolean, adaptiveComb: Boolean, smoothLines: Boolean, repair: Boolean)
     /** How the picture is laid out on the Surface. [fit]: 0 fit, 1 stretch, 2 crop. [eyeShift]: fraction of the width. */
     fun setView(aspect: Float, fit: Int, scale: Float, stereo: Boolean, eyeShift: Float)
-    /** The menu's backdrop: the picture blurred and dimmed, eased in and out unless [now]. */
+    /**
+     * The menu's backdrop: black, with the picture moved into the menu's preview ([setPreview]). The picture moves
+     * there and back over a moment, unless [now]. Where there is no picture, NO SIGNAL takes its place.
+     */
     fun setBackdrop(on: Boolean, now: Boolean)
+    /** Where the menu's preview is on the Surface, in pixels, and its corner radius: where [setBackdrop] puts the picture. */
+    fun setPreview(left: Int, top: Int, right: Int, bottom: Int, radius: Float)
+    /** What the card shown where there is no picture says: the chosen channel ("R8"), or "" for NO SIGNAL. */
+    fun setCardLabel(label: String)
     /** Debug: save the next [seconds] of watched IQ as [prefix].cs16 + .json. */
     fun record(seconds: Double, prefix: String)
     fun status(): String
@@ -79,6 +86,8 @@ object Native : Engine {
     external override fun setPicture(lumaComb: Boolean, adaptiveComb: Boolean, smoothLines: Boolean, repair: Boolean)
     external override fun setView(aspect: Float, fit: Int, scale: Float, stereo: Boolean, eyeShift: Float)
     external override fun setBackdrop(on: Boolean, now: Boolean)
+    external override fun setPreview(left: Int, top: Int, right: Int, bottom: Int, radius: Float)
+    external override fun setCardLabel(label: String)
     external override fun record(seconds: Double, prefix: String)
     external override fun status(): String
     external override fun setSurface(surface: Surface?)

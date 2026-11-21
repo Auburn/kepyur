@@ -5,6 +5,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Shader
 import android.os.Looper
 import android.view.View
 import org.junit.Test
@@ -18,7 +22,8 @@ import java.io.File
 
 /**
  * Renders [MenuView] off screen to PNGs, for looking at the menu without a device.
- * The bitmaps start fully transparent: the menu's own background is a translucent scrim.
+ * The bitmaps start black, as the screen behind the menu is, with a stand-in for the picture where the preview
+ * is (on the phone the native screen draws the real one there, through the hole the menu leaves).
  *
  *   gradle testDebugUnitTest --tests com.kepyur.app.MenuScreenshotTest -Pshots=/some/dir
  *
@@ -32,19 +37,41 @@ class MenuScreenshotTest {
         File(System.getProperty("kepyur.shots") ?: "build/menu-shots").also { it.mkdirs() }
     }
 
-    private val noop = object : MenuView.Listener {
+    /** Hears where the preview is, and whether a slider has the picture full size, and nothing else. */
+    private class Quiet : MenuView.Listener {
+        val preview = RectF()
+        var radius = 0f
+        var peeking = false
         override fun onTune() {}
         override fun onScan() {}
         override fun onView() {}
         override fun onPicture(rebuild: Boolean) {}
         override fun onSignal(retune: Boolean) {}
-        override fun onPeek(on: Boolean) {}
+        override fun onPeek(on: Boolean) { peeking = on }
         override fun onStatusAction() {}
         override fun onClose() {}
+        override fun onPreview(left: Int, top: Int, right: Int, bottom: Int, radius: Float) {
+            preview.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+            this.radius = radius
+        }
+    }
+
+    /**
+     * A sky over a field where the picture is, so that it can be told from the panels: in the preview, or the whole
+     * screen while a slider is held (a peek).
+     */
+    private fun standIn(c: Canvas, at: Quiet) {
+        val where = if (at.peeking) RectF(0f, 0f, c.width.toFloat(), c.height.toFloat()) else at.preview
+        if (where.isEmpty) return
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.shader = LinearGradient(0f, where.top, 0f, where.bottom, Color.rgb(70, 140, 200), Color.rgb(150, 110, 60),
+            Shader.TileMode.CLAMP)
+        val r = if (at.peeking) 0f else at.radius
+        c.drawRoundRect(where, r, r, p)
     }
 
     private val live = MenuState(
-        tone = Tone.LIVE, headline = "R4 · 5769 MHz", detail = "NTSC · 60 fps · 27 dB", radioReady = true,
+        tone = Tone.LIVE, headline = "R4 · 5769 MHz", detail = "NTSC · 60 fps · 27 dB", radioReady = true, locked = true,
         found = listOf(Found(5769.2, "R4", 31f, "NTSC"), Found(5843.0, "R6", 22f, "NTSC"), Found(5760.4, "F2", 12f, "PAL")),
         stats = "USB 3 · 40 MS/s · processing 46% · 0 dropped · 0 restarts",
     )
@@ -55,7 +82,8 @@ class MenuScreenshotTest {
         val prefs = activity.getSharedPreferences("t-$name", Context.MODE_PRIVATE)
         prefs.edit().clear().commit()
         val settings = Settings(prefs).apply(setup)
-        val menu = MenuView(activity, settings, noop)
+        val quiet = Quiet()
+        val menu = MenuView(activity, settings, quiet)
         activity.setContentView(menu)
         menu.render(state)
         menu.showTab(tab, animate = false)
@@ -66,8 +94,10 @@ class MenuScreenshotTest {
         then(menu)
         shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(600))   // let a fade finish
         val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        bitmap.eraseColor(Color.TRANSPARENT)
-        menu.draw(Canvas(bitmap))
+        bitmap.eraseColor(Color.BLACK)
+        val canvas = Canvas(bitmap)
+        standIn(canvas, quiet)
+        menu.draw(canvas)
         File(outDir, "$name.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
     }
 
@@ -95,6 +125,11 @@ class MenuScreenshotTest {
     fun channelError() = shoot("channel_error", 0, MenuState(
         tone = Tone.WARN, headline = "Trying again",
         detail = "The radio did not start: bulk transfer timed out while loading firmware", action = "Try now"), 2400, 1080)
+
+    /** Nothing to say along the top: the name of the app there instead. */
+    @Test @Config(qualifiers = PHONE)
+    fun channelQuiet() = shoot("channel_quiet", 0, MenuState(tone = Tone.BUSY, headline = "Working", radioReady = true),
+        2400, 1080, tuned)
 
     @Test @Config(qualifiers = PHONE)
     fun view() = shoot("view", 1, live, 2400, 1080, tuned)
@@ -144,7 +179,7 @@ class MenuScreenshotTest {
     @Test @Config(qualifiers = SMALL)
     fun smallPicture() = shoot("small_picture", 2, live, 1600, 720, tuned)
 
-    /** A short screen and a status that needs two lines: the tabs and Close menu must still all be there. */
+    /** A short screen and a long status: the line of the status along the top, the tabs and the preview all fit. */
     @Test @Config(qualifiers = SMALL)
     fun smallNoAdapter() = shoot("small_noadapter", 0, MenuState(
         tone = Tone.IDLE, headline = "No adapter", detail = "Plug the Wi-Fi adapter into the phone's USB port."), 1600, 720)
