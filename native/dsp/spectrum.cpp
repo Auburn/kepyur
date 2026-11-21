@@ -113,14 +113,15 @@ std::vector<Hump> find_humps(const std::vector<float> &db, double fs, double edg
   return out;
 }
 
-float carrier_snr(const std::vector<float> &db, double fs, double span_hz) {
+float carrier_snr(const std::vector<float> &db, double fs, double span_hz, double carrier_hz, double pass_hz) {
   const int n = static_cast<int>(db.size());
   const double bin = fs / n;
   const std::vector<float> sm = smooth_db(db, bin);
   std::vector<float> in;
   float pk = -1e9f;
   for (int i = 0; i < n; i++) {
-    if (std::fabs((i - n / 2) * bin) > span_hz) continue;
+    const double f = (i - n / 2) * bin;
+    if (std::fabs(f - carrier_hz) > span_hz || (pass_hz > 0 && std::fabs(f) > pass_hz)) continue;
     in.push_back(sm[i]);
     pk = std::max(pk, sm[i]);
   }

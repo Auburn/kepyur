@@ -1,6 +1,13 @@
 // A stand-in for wsdr::Receiver that plays a recording back as a live, tunable 8812BU (kp_sim only).
 // The recording's VTX stays at its real frequency: tuning elsewhere moves it in the band, and a step far
 // from it shows only noise. Bank pacing is real time. Env: KP_SIM_FILE (.cs16, 40 MS/s, centre 5770 MHz).
+// RxSettings::centre is honoured like the chip does (the hardware centre moves beside the pilot, shift_hz = freq -
+// centre, and the recording moves with the centre). Path B is a second antenna for the combiner as the 8812BU
+// delivers one: the same signal turned by 90 degrees at half amplitude, with noise of its own, and ahead of
+// path A by the adapter's 146 ns (6 samples at 40 MS/s, 3 at 20 MS/s: wifi-sdr FINDINGS.md, "8822B dual-path
+// tap"). A combiner that adds the two as they come loses the colour on it.
+// KP_SIM_DROP_EVERY=N loses every Nth bank the way the adapter's stream drops one it collected too late: not
+// delivered, counted in RxStatus::mid_drops, and BankMeta::seq steps over it.
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -33,8 +40,10 @@ struct Sim {
   std::vector<int16_t> rec;  // I,Q (value << 4)
   size_t pos = 0;
   double rec_centre = 5770e6;
+  unsigned drop_every = 0;  // KP_SIM_DROP_EVERY
 };
 Sim *g_sim = nullptr;
+constexpr double kLeadB = 146e-9;  // path B ahead of path A
 }  // namespace
 
 Receiver::Receiver(Logger_t log) : _log(std::move(log)) {}
@@ -58,6 +67,7 @@ void Receiver::open(uint16_t pid, const RxSettings &initial, int, const std::str
   g_sim->rec.resize(bytes / 2);
   if (std::fread(g_sim->rec.data(), 2, g_sim->rec.size(), fp) != g_sim->rec.size()) throw std::runtime_error("short read");
   std::fclose(fp);
+  if (const char *d = std::getenv("KP_SIM_DROP_EVERY")) g_sim->drop_every = static_cast<unsigned>(std::atoi(d));
   _set = initial;
   _caps = {};
   _caps.pid = pid;
@@ -109,7 +119,16 @@ void Receiver::worker() {
   std::normal_distribution<float> nd(0, 1);
   const size_t N = Stream8822b::kBankSamples;
   std::vector<uint8_t> bank(N * 8);
-  uint64_t seq = 0;
+  // path B's own noise, from a table: the thread has no time for a second pair of Gaussian draws per sample, and
+  // path A's draws must stay as they are (a watch without the combiner decodes the same frames as ever)
+  std::vector<float> nb(4096);
+  {
+    std::mt19937 rb(11);
+    for (auto &v : nb) v = nd(rb);
+  }
+  uint32_t xs = 2463534242u;
+  std::vector<std::complex<float>> clean(N + 16);  // the bank before noise, and the next samples path B is ahead by
+  uint64_t seq = 0, run_banks = 0;
   double ph = 0;
   auto t_next = std::chrono::steady_clock::now();
   RxSettings s;
@@ -129,9 +148,11 @@ void Receiver::worker() {
       m = {};
       m.gen = ++_gen;
       m.fs = rate_of(s.rate_sel);
-      m.centre_hz = std::lround(s.freq / 5e6) * 5e6;
+      // the chip's 40 MHz channels put the centre on the 5 MHz grid, nearest RxSettings::centre if one is set
+      m.centre_hz = std::lround((s.centre > 0 ? s.centre : s.freq) / 5e6) * 5e6;
       m.shift_hz = s.freq - m.centre_hz;
       seq = 0;
+      run_banks = 0;
       t_next = std::chrono::steady_clock::now();
       std::lock_guard<std::mutex> l(_m);
       _st.state = RxState::Streaming;
@@ -146,30 +167,57 @@ void Receiver::worker() {
     const std::complex<float> rot(static_cast<float>(std::cos(2 * M_PI * move / 40e6)),
                                   static_cast<float>(std::sin(2 * M_PI * move / 40e6)));
     std::complex<float> lo(static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
-    for (size_t i = 0; i < N; i++) {
+    // one output sample, before noise
+    const auto next = [&](size_t &pos, std::complex<float> &osc) {
       float re = 0, im = 0;
       for (int k = 0; k < dec; k++) {
-        const size_t p = g_sim->pos;
-        g_sim->pos = (g_sim->pos + 2) % g_sim->rec.size();
+        const size_t p = pos;
+        pos = (pos + 2) % g_sim->rec.size();
         if (visible) {
           const std::complex<float> x(g_sim->rec[p] / 16.f, g_sim->rec[p + 1] / 16.f);
-          const auto y = x * lo;
+          const auto y = x * osc;
           re += y.real();
           im += y.imag();
         }
-        lo *= rot;
+        osc *= rot;
       }
-      re = re / dec + 3 * nd(rng);  // a little noise so empty steps have a floor
-      im = im / dec + 3 * nd(rng);
-      const uint64_t li = static_cast<uint64_t>(static_cast<int>(std::lround(re)) & 0xFFF);
-      const uint64_t lq = static_cast<uint64_t>(static_cast<int>(std::lround(im)) & 0xFFF);
-      const uint64_t w = li | (lq << 12);
+      return std::complex<float>(re / dec, im / dec);
+    };
+    for (size_t i = 0; i < N; i++) clean[i] = next(g_sim->pos, lo);
+    ph = std::arg(lo);
+    // path B runs ahead: its last samples of this bank are the first of the next one (looked at, not consumed)
+    const size_t lead = static_cast<size_t>(std::lround(kLeadB * m.fs));
+    {
+      size_t pos = g_sim->pos;
+      std::complex<float> osc = lo;
+      for (size_t i = 0; i < lead; i++) clean[N + i] = next(pos, osc);
+    }
+    for (size_t i = 0; i < N; i++) {
+      const float re = clean[i].real() + 3 * nd(rng);  // a little noise so empty steps have a floor
+      const float im = clean[i].imag() + 3 * nd(rng);
+      const int ai = static_cast<int>(std::lround(re)), aq = static_cast<int>(std::lround(im));
+      const uint64_t li = static_cast<uint64_t>(ai & 0xFFF);
+      const uint64_t lq = static_cast<uint64_t>(aq & 0xFFF);
+      // path B (kDmaBothPaths8822b: I [35:24], Q [47:36]) = j * A / 2, `lead` samples on, plus its own noise
+      // (rounded by hand: two more calls of lround per sample are time this thread does not have)
+      xs ^= xs << 13, xs ^= xs >> 17, xs ^= xs << 5;
+      const std::complex<float> b = clean[i + lead];
+      const float fi = -0.5f * b.imag() + 3 * nb[xs & 4095], fq = 0.5f * b.real() + 3 * nb[(xs >> 12) & 4095];
+      const int pi = static_cast<int>(fi + (fi < 0 ? -0.5f : 0.5f));
+      const int pq = static_cast<int>(fq + (fq < 0 ? -0.5f : 0.5f));
+      const uint64_t bi = static_cast<uint64_t>(pi & 0xFFF);
+      const uint64_t bq = static_cast<uint64_t>(pq & 0xFFF);
+      const uint64_t w = li | (lq << 12) | (bi << 24) | (bq << 36);
       std::memcpy(bank.data() + 8 * i, &w, 8);
     }
-    ph = std::arg(lo);
-    m.seq = seq++;
-    _sink(bank.data(), bank.size(), m);
-    {
+    run_banks++;
+    if (g_sim->drop_every && run_banks > 4 && run_banks % g_sim->drop_every == 0) {
+      seq++;  // lost: the next bank's seq shows the hole
+      std::lock_guard<std::mutex> l(_m);
+      _st.mid_drops++;
+    } else {
+      m.seq = seq++;
+      _sink(bank.data(), bank.size(), m);
       std::lock_guard<std::mutex> l(_m);
       _st.banks++;
     }

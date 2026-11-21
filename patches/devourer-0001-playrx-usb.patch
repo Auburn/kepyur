@@ -1,0 +1,121 @@
+diff --git a/src/UsbTransport.cpp b/src/UsbTransport.cpp
+index dd4b9af..cf18a5b 100644
+--- a/src/UsbTransport.cpp
++++ b/src/UsbTransport.cpp
+@@ -422,6 +422,17 @@ void UsbTransport::write_batch_begin() {
+    * a suspect event loop; stay synchronous rather than pipeline into it. */
+   if (_aw_abandoned)
+     return;
++#ifdef _WIN32
++  /* AnalogRX (Windows): the pipeline relies on EP0 completing queued control transfers strictly in
++   * order, one after another, as Linux usbfs does. Under WinUSB overlapping control transfers are not
++   * serialised that way, and the 8812BU stalls them by the hundred during the RF table load (then a
++   * read fails and bring-up aborts). Stay synchronous unless DEVOURER_USB_PIPELINE=1 asks otherwise. */
++  {
++    const char *p = std::getenv("DEVOURER_USB_PIPELINE");
++    if (!p || std::strcmp(p, "1") != 0)
++      return;
++  }
++#endif
+   if (_aw_all.empty()) {
+     /* Built transactionally: a slot whose transfer allocation failed must
+      * never reach fill/submit, so on any failure the pool is torn back
+diff --git a/src/UsbTransport.h b/src/UsbTransport.h
+index c7189f6..7000680 100644
+--- a/src/UsbTransport.h
++++ b/src/UsbTransport.h
+@@ -9,6 +9,8 @@
+  * rides here too — its lifetime is the transport's. */
+ 
+ #include <atomic>
++#include <chrono>
++#include <thread>
+ #include <memory>
+ #include <mutex>
+ #include <vector>
+@@ -197,6 +199,21 @@ private:
+    * disables pipelining at once but must keep the batch's verdict (its
+    * write errors) for write_batch_end to return. */
+   bool _batch = false;
++  /* AnalogRX circuit breaker: transfers that failed even after their retries, in a row. On Windows an
++   * unplugged adapter answers LIBUSB_ERROR_IO (not NO_DEVICE), so without this a bring-up on a vanished
++   * adapter spends minutes retrying thousands of register writes. After kCtrlDeadAfter failures in a row
++   * (or one NO_DEVICE) every further control transfer fails at once. */
++  static constexpr int kCtrlDeadAfter = 8;
++  int _ctrl_fail_run = 0;
++  bool _ctrl_dead = false;
++  void ctrl_failed(int rc) {
++    if (_ctrl_dead) return;
++    if (rc == LIBUSB_ERROR_NO_DEVICE || ++_ctrl_fail_run >= kCtrlDeadAfter) {
++      _ctrl_dead = true;
++      _logger->error("USB: adapter not responding ({}, {} failures in a row): giving up on it",
++                     libusb_error_name(rc), _ctrl_fail_run);
++    }
++  }
+   bool _batch_open = false;
+   int _batch_depth = 0; /* begin/end nest; the outermost pair owns the verdict */
+   std::shared_ptr<AsyncPool> _aw = std::make_shared<AsyncPool>();
+@@ -294,13 +311,28 @@ template <typename T> T UsbTransport::ctrl_read(uint16_t reg_num) {
+     _logger->error("rtw_read({:04x}) pipelined failed; reading synchronously",
+                    reg_num);
+   }
+-  _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
+-  if (libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num,
+-                              0, (uint8_t *)&data, sizeof(T),
+-                              USB_TIMEOUT) == sizeof(T)) {
+-    return data;
++  /* AnalogRX (Windows): retry a failed read a few times before giving up. Under WinUSB at USB 3 a
++   * control read in the middle of bring-up can fail once and then work; one glitch should not abort
++   * a ~45 s bring-up. The first error is logged with libusb's code. */
++  if (_ctrl_dead) throw std::ios_base::failure("rtw_read: adapter not responding");
++  int rc = 0;
++  for (int attempt = 0; attempt < 5; attempt++) {
++    /* back off: the chip refuses EP0 for a while when it is busy (seen mid RF table load) */
++    static const int kBackoffMs[] = {0, 1, 5, 20, 100};
++    if (kBackoffMs[attempt]) std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs[attempt]));
++    _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
++    rc = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num, 0, (uint8_t *)&data,
++                                 sizeof(T), USB_TIMEOUT);
++    if (rc == static_cast<int>(sizeof(T))) {
++      if (attempt) _logger->warn("rtw_read({:04x}) ok on retry {}", reg_num, attempt);
++      _ctrl_fail_run = 0;
++      return data;
++    }
++    if (rc == LIBUSB_ERROR_NO_DEVICE) break;  /* unplugged: no point waiting */
++    if (!attempt) _logger->warn("rtw_read({:04x}) failed: {} ({}), retrying", reg_num, libusb_error_name(rc), rc);
+   }
+-  _logger->error("rtw_read({:04x}), sizeof(T) = {}", reg_num, sizeof(T));
++  _logger->error("rtw_read({:04x}), sizeof(T) = {}: {}", reg_num, sizeof(T), libusb_error_name(rc));
++  ctrl_failed(rc);
+   throw std::ios_base::failure("rtw_read");
+   return 0;
+ }
+@@ -309,11 +341,24 @@ template <typename T> bool UsbTransport::ctrl_write(uint16_t reg_num, T value) {
+   /* Unsubmittable pipelined write -> synchronous, in order (see write32_wide). */
+   if (_batch && async_write(reg_num, 0, &value, sizeof(T)))
+     return true;
++  if (_ctrl_dead) return false;
+   _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
+-  const bool ok =
+-      libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5, reg_num,
+-                              0, (uint8_t *)&value, sizeof(T),
+-                              USB_TIMEOUT) == sizeof(T);
++  int rc = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5, reg_num, 0, (uint8_t *)&value,
++                                   sizeof(T), USB_TIMEOUT);
++#ifdef _WIN32
++  /* AnalogRX (Windows): a refused write is retried with the same back-off as reads, and logged (a
++   * silently dropped register write leaves the radio misprogrammed). */
++  static const int kBackoffMs[] = {1, 5, 20, 100};
++  for (int attempt = 0; rc != static_cast<int>(sizeof(T)) && rc != LIBUSB_ERROR_NO_DEVICE && attempt < 4; attempt++) {
++    if (!attempt) _logger->warn("rtw_write({:04x}) failed: {} ({}), retrying", reg_num, libusb_error_name(rc), rc);
++    std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs[attempt]));
++    rc = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5, reg_num, 0, (uint8_t *)&value,
++                                 sizeof(T), USB_TIMEOUT);
++  }
++#endif
++  if (rc == static_cast<int>(sizeof(T))) _ctrl_fail_run = 0;
++  else ctrl_failed(rc);
++  const bool ok = rc == static_cast<int>(sizeof(T));
+   if (!ok && _batch_open)
+     _aw->write_errors++; /* the fallback failed too (see write32_wide) */
+   return ok;

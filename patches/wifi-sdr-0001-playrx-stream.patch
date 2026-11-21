@@ -1,0 +1,496 @@
+diff --git a/src/receiver.cpp b/src/receiver.cpp
+index 72e29c5..a8747bf 100644
+--- a/src/receiver.cpp
++++ b/src/receiver.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <tuple>
+ 
+@@ -87,7 +88,7 @@ void Receiver::open(uint16_t pid, const RxSettings &initial, int bus, const std:
+   if (sys_fd >= 0)
+     o.reset = false; // a USB reset can re-enumerate the device and invalidate the granted fd
+   o.bw = cu && !initial.allow_gapped ? 20 : width_of(initial, cu); // 8812CU at 40 MS/s only gapped
+-  o.channel = channel_for(initial.freq, o.bw);
++  o.channel = channel_for(initial.centre > 0 ? initial.centre : initial.freq, o.bw);
+   o.thermal_track = false; // no host register traffic while streaming
+   auto s = std::make_unique<Session>(_log);
+   try {
+@@ -171,7 +172,7 @@ void Receiver::set(const RxSettings &s) {
+     n.gain_db = std::clamp(n.gain_db, 0.0, _caps.gain_max);
+     const auto hw = [&](const RxSettings &x) {
+       const int w = width_of(x, _caps.cu);
+-      return std::make_tuple(channel_for(x.freq, w), w, x.rate_sel, x.agc, x.agc ? 0 : igi_for(x.gain_db, _caps.cu));
++      return std::make_tuple(channel_for(x.centre > 0 ? x.centre : x.freq, w), w, x.rate_sel, x.agc, x.agc ? 0 : igi_for(x.gain_db, _caps.cu));
+     };
+     const bool same_hw = hw(n) == hw(_set);
+     _set = n;
+@@ -230,7 +231,7 @@ void Receiver::worker() {
+       _st.state = RxState::Starting;
+     }
+     const int width = width_of(cur, _caps.cu);
+-    const int ch = channel_for(cur.freq, width);
++    const int ch = channel_for(cur.centre > 0 ? cur.centre : cur.freq, width);
+     const double fs = rate_of(cur.rate_sel);
+     const double centre = centre_of(ch, width);
+     try {
+@@ -257,6 +258,9 @@ void Receiver::worker() {
+     c.la.rate_sel = cur.rate_sel;
+     // >= 20 MS/s needs ~13 ms of posted URBs; the 8812CU wants ~100 ms (FINDINGS §4)
+     c.depth = _caps.cu || cur.rate_sel <= 2 ? 256 : 64;
++    // AnalogRX: WSDR_URB_DEPTH overrides the posted bulk-IN transfers (Windows tuning experiments)
++    if (const char *d = std::getenv("WSDR_URB_DEPTH"))
++      if (std::atoi(d) > 0) c.depth = std::min(4096, std::atoi(d));
+     c.la.igi = cur.agc ? -1 : igi_for(cur.gain_db, _caps.cu);
+     c.la.no_cca = !cur.agc;
+     // 0 leaves devourer's DFIR (8822B: BW20 set; 8822C: per width). The wide sets only where the rate carries
+@@ -285,14 +289,22 @@ void Receiver::worker() {
+       _st.gapped = c.gapped;
+       _st.state = RxState::Streaming;
+     }
++    // kepyur: banks the run drops are counted in the status at once, and leave a hole in BankMeta::seq
++    c.on_drop = [&](bool at_start) {
++      std::lock_guard<std::mutex> l(_m);
++      (at_start ? _st.start_late_skips : _st.mid_drops)++;
++    };
++    uint32_t run_next = 0; // the run's own number (BankInfo::seq) of the bank after the last one delivered
+     bool clean_start = false;
+-    const auto on_bank = [&](const uint8_t *bank, const BankInfo &) {
++    const auto on_bank = [&](const uint8_t *bank, const BankInfo &bi) {
+       if (!clean_start) {
+         clean_start = true;
+         consecutive_faults = 0;
+         std::lock_guard<std::mutex> l(_m);
+         _st.error.clear();
+       }
++      seq += bi.seq - run_next; // kepyur: the run's count includes the banks it dropped before this one
++      run_next = bi.seq + 1;
+       meta.seq = seq++;
+       {
+         std::lock_guard<std::mutex> l(_m);
+@@ -323,6 +335,11 @@ void Receiver::worker() {
+     if (!_s->reg().alive()) {
+       next = RxState::Lost;
+       why = "adapter lost: " + ss.error;
++    } else if (ss.wedged) {
++      // kepyur: no restart brings a wedged C2H engine back (stream88xx.cpp, c2h_wedged): stop now, and say why, so
++      // that the owner opens the adapter again instead of waiting out five more failed starts
++      next = RxState::Error;
++      why = "stream wedged, open the adapter again: " + ss.error;
+     } else if (++consecutive_faults >= 5) {
+       next = RxState::Error;
+       why = "stream keeps failing: " + ss.error;
+@@ -333,10 +350,15 @@ void Receiver::worker() {
+       _st.state = next;
+       _st.error = why;
+       _st.last_fault = why;
++      _st.wedged = ss.wedged;
+     }
+     if (next != RxState::Starting)
+       break;
+-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    // kepyur: was 100 ms. A restart is a hole in the stream (in the picture) as long as this pause, the next
++    // start's drain and the bring-up of the run add up to; 10 ms brings a restart's hole from ~200 ms to ~55 ms
++    // on a host that restarts every few seconds (Pixel 8 Pro, USB 3), with no more failed starts. The
++    // 5-faults-in-a-row rule above still ends a stream that never runs.
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+   }
+ }
+ 
+diff --git a/src/receiver.h b/src/receiver.h
+index f107565..e5344db 100644
+--- a/src/receiver.h
++++ b/src/receiver.h
+@@ -47,6 +47,9 @@ inline uint16_t model_pid(uint16_t vid, uint16_t pid) {
+ 
+ struct RxSettings {
+   double freq = 5180e6; // requested centre
++  // AnalogRX: where to put the hardware centre instead (the channel nearest it); 0 = nearest freq. The bank's
++  // shift_hz is still freq - centre. Analog FM video must not sit on the chip's DC point (its DC filter eats it).
++  double centre = 0;
+   int rate_sel = 5;     // fs = 80 MHz >> rate_sel: 5 = 2.5, 4 = 5, 3 = 10, 2 = 20, 1 = 40 MS/s; 0 = 80 MS/s
+                         // (8812BU, gapped only: 80 MHz width + vendor BW80 RX DFIR, ~77 MHz at -6 dB)
+   bool wide = true;     // at 40 MS/s: 40 MHz channel width (8812BU: + vendor BW40 RX DFIR; 8822C: devourer's
+@@ -74,7 +77,8 @@ enum class RxState { Closed, Opening, Starting, Streaming, Lost, Error };
+ const char *rx_state_name(RxState s);
+ 
+ struct BankMeta {
+-  uint64_t seq = 0;      // banks delivered since start()
++  uint64_t seq = 0;      // banks since start(). kepyur: counting those a run dropped (late or overrun, see
++                         // RxStatus), so a step of more than 1 within one gen means samples are missing there
+   uint32_t gen = 0;      // stream run (changes on every restart: reset DSP state when it does)
+   uint32_t cfg = 0;      // settings generation (changes only when the caller changed settings)
+   double fs = 0;         // sample rate
+@@ -102,6 +106,13 @@ struct RxStatus {
+   bool settling = false; // a settings change is waiting to be applied (the run above is about to end)
+   bool gapped = false;   // the current run is gapped (BankMeta::gapped)
+   unsigned start_retries = 0; // stream starts repeated because the first packet never came (issue #2)
++  // kepyur: banks the 8822B stream dropped instead of delivering them, counted as it drops them: late among the
++  // first few of a run / late or overrun mid-run (the run goes on; before, each of these ended it and showed in
++  // restarts). Since open().
++  uint64_t start_late_skips = 0, mid_drops = 0;
++  // kepyur: the worker ended (state Error) because the 8822B's C2H engine wedged (stream88xx.cpp, c2h_wedged).
++  // Nothing short of opening the adapter again recovers it; until open(), this stays set.
++  bool wedged = false;
+ };
+ 
+ class Receiver {
+diff --git a/src/session.cpp b/src/session.cpp
+index c876980..e3ec784 100644
+--- a/src/session.cpp
++++ b/src/session.cpp
+@@ -2,6 +2,8 @@
+ #include "session.h"
+ #include "receiver.h" // model_pid
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ #include "UsbOpen.h"
+@@ -9,7 +11,24 @@
+ 
+ namespace wsdr {
+ 
+-
++// kepyur: whether the link is SuperSpeed. libusb asks the kernel, and for a device opened from an fd (Android) it
++// can only do so with USBDEVFS_GET_SPEED, which older kernels lack (an LG G7 on Android 10, kernel 4.9): the speed
++// comes back unknown. Taken as USB 2, a SuperSpeed link then got 4096-byte EP0 block writes (the USB 2 size in
++// Reg), which the chip stalls: LIBUSB_ERROR_PIPE at the streamer's first block, every start. The descriptors say it
++// then: a bulk endpoint's packets are 1024 bytes only at SuperSpeed (512 at high speed), and a USB 3 device reports
++// bcdUSB 0x0300 or above only while it runs at SuperSpeed (0x0210 at high speed).
++static bool superspeed_link(libusb_device_handle *h) {
++  libusb_device *d = libusb_get_device(h);
++  const int sp = libusb_get_device_speed(d);
++  if (sp != LIBUSB_SPEED_UNKNOWN)
++    return sp >= LIBUSB_SPEED_SUPER;
++  const int mps = libusb_get_max_packet_size(d, 0x84); // the bulk-IN the streams read
++  libusb_device_descriptor dd{};
++  const bool ss = mps > 0 ? mps >= 1024 : libusb_get_device_descriptor(d, &dd) == 0 && dd.bcdUSB >= 0x0300;
++  std::fprintf(stderr, "usb: the kernel does not give the link speed; USB %d from the descriptors (bulk-IN packets %d)\n",
++               ss ? 3 : 2, mps);
++  return ss;
++}
+ 
+ static ChannelWidth_t width_of(int bw) {
+   switch (bw) {
+@@ -85,7 +104,7 @@ void Session::open(const OpenOpts &o) {
+   }
+   _s.adopt_handle(h);
+   _s.adopt_lock(lock);
+-  _ss = libusb_get_device_speed(libusb_get_device(h)) >= LIBUSB_SPEED_SUPER;
++  _ss = superspeed_link(h);
+ 
+   devourer::DeviceConfig cfg;
+   cfg.tuning.thermal_track = o.thermal_track;
+@@ -94,6 +113,17 @@ void Session::open(const OpenOpts &o) {
+   // users own bulk-IN and want fixed gain. The switch (tuning.j3_runtime_thread, OpenIPC/devourer#498)
+   // is required: the pinned devourer (external/devourer) has it, and a build without it must fail.
+   cfg.tuning.j3_runtime_thread = false;
++  // Play League: Jaguar2 (8812BU/8822BU) init-time firmware register offload. The PHY tables (~44k table
++  // words) go to the chip as ~2800 batched commands the firmware replays, instead of one USB control transfer
++  // per write, which costs ~1-2 ms apiece under WinUSB. Measured on an 8812BU (Windows 11, USB 3): bring-up
++  // 47 s -> 11 s, same IQK result, same noise floor, same video lock (60 fps, 0.96). 1 = BB + AGC tables,
++  // 3 = also the RF tables; devourer re-applies the tables directly if the offload fails. On by default on
++  // Windows only (Linux / macOS bring up in ~3-5 s and are untested with it). WSDR_FW_TABLE_OFLD overrides
++  // (0 = off).
++#ifdef _WIN32
++  cfg.tuning.fw_table_offload = 3;
++#endif
++  if (const char *e = std::getenv("WSDR_FW_TABLE_OFLD")) cfg.tuning.fw_table_offload = std::atoi(e);
+   WiFiDriver driver(_log);
+   auto dev = driver.CreateRadio(h, ctx, lock, cfg);
+   if (!dev)
+diff --git a/src/stream88xx.cpp b/src/stream88xx.cpp
+index a663615..1922fb3 100644
+--- a/src/stream88xx.cpp
++++ b/src/stream88xx.cpp
+@@ -7,6 +7,7 @@
+ #include <cstring>
+ #include <optional>
+ #include <stdexcept>
++#include <thread>
+ 
+ #include "bulkin88xx.h"
+ #include "c2h88xx.h"
+@@ -27,6 +28,7 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
+ constexpr uint8_t kSentinel[8] = {0xE1, 0xF1, 0x47, 0x5E, 0xA5, 0xA5, 0xA5, 0xA5}; // stream8822b.S
+ 
+ constexpr unsigned kStartRetries = 2;
++constexpr uint32_t kStartGraceBanks = 4; // AnalogRX: late banks tolerated (dropped) at the start of a run
+ 
+ size_t chunk_off(int k) { return Stream8822b::kPrefix + static_cast<size_t>(k) * Stream8822b::kChunk; }
+ 
+@@ -53,21 +55,41 @@ uint8_t fill(int bank, size_t i) { // synthetic pattern
+ }
+ 
+ // Where the CPU program got to, for a missed first packet: its DMEM state block (magic, seq, state,
+-// t_arm), the chip clock, the C2H trigger and the LA engine.
++// t_arm), the chip clock, the C2H trigger and the LA engine. kepyur: and the RX DMA registers the C2H wedge
++// is known by (notes/c2h-wedge-handoff.md: r288 BIT7 overflow, r280 / r10c / r284 / r290 as left).
+ std::string chip_state(Reg &r, Cpu8822b &cpu) {
+   try {
+     const uint32_t now = r.r32(0x0568);
+     uint32_t s[5];
+     cpu.dmem_read(kStateOff, s, sizeof s);
+-    char b[160];
+-    std::snprintf(b, sizeof b, "; magic %08x seq %u state %u t_arm %u now %u r294 %08x r7c0 %08x", s[0], s[1],
+-                  s[2], s[4], now, r.r32(0x0294), r.r32(0x07C0));
++    char b[320];
++    std::snprintf(b, sizeof b,
++                  "; magic %08x seq %u state %u t_arm %u now %u r294 %08x r7c0 %08x r288 %08x r284 %08x r280 %08x "
++                  "r10c %08x r290 %08x",
++                  s[0], s[1], s[2], s[4], now, r.r32(0x0294), r.r32(0x07C0), r.r32(0x0288), r.r32(0x0284),
++                  r.r32(0x0280), r.r32(0x010C), r.r32(0x0290));
+     return b;
+   } catch (const std::exception &e) {
+     return std::string("; state unreadable: ") + e.what();
+   }
+ }
+ 
++// kepyur: the C2H engine has wedged (FINDINGS §4, notes/c2h-wedge-handoff.md, signature (a)): no packet has come
++// for a whole timeout, yet the request last written to 0x294 is still pending (BIT16). A working engine takes a
++// request in ~40 us; this one never will. A new start, an endpoint clear_halt and the register pokes tried so far
++// do not bring it back; only a fresh bring-up (Session::open) does. It depends on the USB 3 host: never on most,
++// every few seconds on one AMD xHCI controller, every few seconds to minutes on a Pixel 8 Pro. Read twice, apart.
++bool c2h_wedged(Reg &r) {
++  try {
++    if (!(r.r32(0x0294) & 0x10000u))
++      return false;
++    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    return (r.r32(0x0294) & 0x10000u) != 0;
++  } catch (...) {
++    return false; // the chip does not answer: not this (an unplug, which the Receiver reports as Lost)
++  }
++}
++
+ } // namespace
+ 
+ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const BankInfo &)> &on_bank,
+@@ -124,7 +146,7 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     cpu.dmem_write(kRecOff, rec, sizeof rec);
+ 
+     rd.start();
+-    rd.drain(30);
++    rd.drain(10);  // kepyur: was 30 ms; a packet ships in ~40 us (see the Receiver's pause between starts)
+     cpu.start();
+     // Now and then (~1 start in 30, issue #2) the CPU stalls at its first MAC-register access (the LA
+     // arm) until the host itself reads the MAC block; a read of 0x0003 or 0x0080 does not release it.
+@@ -156,11 +178,31 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     start();
+ 
+     const double budget5 = static_cast<double>(period5) - guard5;
++    // Play League: a bank the host collected too late mid-run (Windows pauses a bulk-IN read for a few hundred
++    // us now and then: ~1-3 a minute per adapter) used to end the run, and the restart cost far more than the
++    // bank. The bank is overrun either way - its trailer ends late ("deadline"), or the ADC overwrote a part's
++    // CPU-written descriptor before it shipped ("framing", right length, wrong descriptor) - and the stream
++    // carries on in step (the trailer's seq still checks), so drop just that bank, as at the start of a run.
++    // Banks are timestamped on arrival, so a dropped one leaves no time shift. A burst (more than 4 drops within
++    // 64 banks) still ends the run: that is not an occasional pause.
++    uint32_t drop_burst = 0, last_drop = 0;
++    const auto mid_drop = [&](uint32_t s, const std::string &why) {
++      if (s - last_drop > 64)
++        drop_burst = 0;
++      last_drop = s;
++      if (++drop_burst > 4)
++        return false;
++      st.mid_drops++;
++      if (st.mid_drops <= 4 || st.mid_drops % 50 == 0)
++        std::fprintf(stderr, "stream: bank %u %s, dropped (%u this run)\n", s, why.c_str(), st.mid_drops);
++      return true;
++    };
+     for (uint32_t seq = 0;; seq++) {
+       if (stop && *stop)
+         break;
+       const int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
+       int part = 0;
++      bool late_skip = false;
+       BankInfo bi;
+       bi.seq = seq;
+       bi.bank = b;
+@@ -174,6 +216,13 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+             stopped = true;
+             break;
+           }
++          // kepyur: a wedged C2H engine is not worth another start (see c2h_wedged): say so at once, and the
++          // Receiver gives up on the run so that its owner can open the adapter afresh
++          if (c2h_wedged(r)) {
++            st.wedged = true;
++            throw std::runtime_error("C2H wedged (bank " + std::to_string(seq) + " part " + std::to_string(part) +
++                                     ")" + chip_state(r, cpu));
++          }
+           const std::string why = first ? chip_state(r, cpu) : ""; // mid-stream the chip may not answer
+           if (retry) {
+             std::fprintf(stderr, "stream: no first packet in %u ms, starting again%s\n", first_ms, why.c_str());
+@@ -200,12 +249,30 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+           rd.release();
+           continue;
+         }
++        // AnalogRX: the late start (above) overruns the next bank too; the chip then sends that bank's trailer
++        // early, one 16 KiB part short. Within the first banks of a run, drop the incomplete bank and go on.
++        // Play League: mid-run the same overrun is dropped too (see mid_drop), once per bank.
++        if (part < 4 && static_cast<size_t>(d.len) == 24 + kTrailerPayload && std::memcmp(d.data, trl_desc, 12) == 0 &&
++            (seq < kStartGraceBanks || late_skip || mid_drop(seq, "short (" + std::to_string(part) + " of 4 parts)"))) {
++          if (seq < kStartGraceBanks && st.start_late_skips++ < 4)
++            std::fprintf(stderr, "stream: bank %u short (%d of 4 parts) at the start of the run, dropped\n", seq, part);
++          late_skip = true;
++          rd.release();
++          break;
++        }
+         const bool trailer = part == 4;
+         const uint8_t *want = trailer ? trl_desc : data_desc;
+         const size_t want_len = 24 + (trailer ? kTrailerPayload : kChunk);
+-        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0)
+-          throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
+-                                   " len " + std::to_string(d.len) + " desc " + hex12(d.data));
++        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0) {
++          // Play League: a data part of the right length whose descriptor the ADC overwrote (an overrun, see
++          // mid_drop): keep reading the bank's parts so the stream stays in step, then drop the bank.
++          const bool overrun = !trailer && static_cast<size_t>(d.len) == want_len && seq >= kStartGraceBanks &&
++                               (late_skip || mid_drop(seq, "part " + std::to_string(part) + " overwritten (" + hex12(d.data) + ")"));
++          if (!overrun)
++            throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
++                                     " len " + std::to_string(d.len) + " desc " + hex12(d.data));
++          late_skip = true;
++        }
+         if (!trailer) {
+           std::memcpy(bank.data() + chunk_off(part), d.data + 24, kChunk);
+         } else {
+@@ -217,15 +284,35 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+           bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
+           bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
+           bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
+-          if (!_c.gapped && bi.end_us * 5 > budget5) // gapped: the LA is stopped while a bank ships
+-            throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
+-                                     std::to_string(bi.end_us) + " us after due");
++          if (!_c.gapped && bi.end_us * 5 > budget5) { // gapped: the LA is stopped while a bank ships
++            // AnalogRX: behind a USB hub the first bank of a run ships ~190 us late every time (the hub's
++            // downstream link waking up), and the run used to fail on it, restart, and fail again for ever.
++            // A late bank among the first few is dropped (its samples are partly overwritten); later ones
++            // still end the run as before.
++            if (seq < kStartGraceBanks) {
++              late_skip = true;
++              if (st.start_late_skips++ < 4)
++                std::fprintf(stderr, "stream: bank %u ended %.1f us after due at the start of the run, dropped\n",
++                             seq, bi.end_us);
++            } else if (late_skip || mid_drop(seq, "ended " + std::to_string(static_cast<int>(bi.end_us)) + " us after due")) {
++              late_skip = true;  // Play League: dropped mid-run instead of ending it (see mid_drop)
++            } else {
++              throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
++                                       std::to_string(bi.end_us) + " us after due");
++            }
++          }
+         }
+         rd.release();
+         part++;
+       }
+       if (stopped)
+         break;
++      if (late_skip) {  // AnalogRX: a late bank at the start of the run is not handed on (see above)
++        seen[b] = true;
++        if (_c.on_drop)  // kepyur: nor is one dropped mid-run; either way the caller hears of it now
++          _c.on_drop(seq < kStartGraceBanks);
++        continue;
++      }
+       // CPU-written windows: descriptors ([104,128) and the 24 bytes before chunks 1..3) and the
+       // sentinel in the last sample. In live data the ADC must have overwritten all of them.
+       uint8_t *tail = bank.data() + kBankBytes - 8;
+diff --git a/src/stream88xx.h b/src/stream88xx.h
+index 69c6cb3..7ce2fd0 100644
+--- a/src/stream88xx.h
++++ b/src/stream88xx.h
+@@ -33,6 +33,10 @@ struct StreamCfg {
+   int guard_us = 20;       // ship a bank this long after the ADC is due to finish it (< 0: test only)
+   bool gapped = false;     // capture one bank, stop, ship, re-arm (banks not contiguous)
+   unsigned pkt_timeout_ms = 200;
++  // kepyur: called on the stream thread each time run() drops a bank instead of handing it to on_bank (late or
++  // overrun), as it happens: StreamStats only comes back when the run ends, and a run that keeps dropping an
++  // occasional bank never does. at_start: one of the first banks of the run (start_late_skips), else mid_drops.
++  std::function<void(bool at_start)> on_drop;
+ };
+ 
+ struct BankInfo {
+@@ -51,9 +55,12 @@ struct StreamStats {
+   unsigned stale = 0;
+   unsigned pattern_bad = 0;
+   unsigned start_retries = 0; // starts repeated because the first packet never came (issue #2)
++  unsigned start_late_skips = 0; // AnalogRX: late banks dropped at the start of a run (behind a USB hub)
++  unsigned mid_drops = 0;        // Play League: banks dropped mid-run (shipped late / overrun) instead of a restart
+   double late_max_us = 0, ship_max_us = 0, end_max_us = 0;
+   double wall_s = 0;
+   std::string error;       // empty unless the stream stopped on a fault
++  bool wedged = false;     // kepyur: the fault was the C2H wedge: only opening the adapter again recovers it
+ };
+ 
+ class Stream8822b {
+diff --git a/src/usbmode.cpp b/src/usbmode.cpp
+index 4c09dbb..6994181 100644
+--- a/src/usbmode.cpp
++++ b/src/usbmode.cpp
+@@ -36,11 +36,12 @@ std::string port_path(libusb_device *d) {
+ } // namespace
+ 
+ namespace {
+-Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail);
++Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail, bool force = false);
+ 
+ // The switch both ways: halmac's set_usb_mode_88xx (PAD_CTRL2 USB23_SW_MODE 2 = USB 3, 1 = USB 2), which
+ // rtw88 uses for USB 2 -> 3 (plus its 0x10C3 write) and the vendor driver also for 3 -> 2.
+-Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb3, std::string *detail) {
++Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb3, std::string *detail,
++                        bool force = false) {
+   const auto fail = [&](const std::string &why) {
+     if (detail)
+       *detail = why;
+@@ -73,10 +74,10 @@ Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb
+   if (const int rc = libusb_open(dev, &h); rc != 0)
+     return fail(std::string("open: ") + libusb_error_name(rc));
+   std::unique_ptr<libusb_device_handle, void (*)(libusb_device_handle *)> h_guard(h, libusb_close);
+-  return switch_mode(h, usb3, detail);
++  return switch_mode(h, usb3, detail, force);
+ }
+ 
+-Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail) {
++Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail, bool force) {
+   const auto fail = [&](const std::string &why) {
+     if (detail)
+       *detail = why;
+@@ -98,7 +99,7 @@ Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail)
+     pad = r.r32(0xc4);
+     if (!(pad & ((3u << 18) | (1u << 20)))) // USB23_SW_MODE / USB3_USB2_TRANSITION
+       return Usb3Switch::Unsupported;
+-    if (usb3 && ((pad >> 18) & 3) == 2)
++    if (usb3 && ((pad >> 18) & 3) == 2 && !force)
+       return Usb3Switch::AlreadyTried;
+     if (usb3)
+       r.w8(0x10c3, static_cast<uint8_t>(r.r8(0x10c3) & ~1u));
+@@ -120,8 +121,8 @@ Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail)
+ }
+ } // namespace
+ 
+-Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail) {
+-  return request_mode(pid, bus, port, true, detail);
++Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail, bool force) {
++  return request_mode(pid, bus, port, true, detail, force);
+ }
+ 
+ Usb3Switch request_usb3_fd(int sys_fd, std::string *detail) {
+diff --git a/src/usbmode.h b/src/usbmode.h
+index 7fa3610..b52e81e 100644
+--- a/src/usbmode.h
++++ b/src/usbmode.h
+@@ -22,7 +22,10 @@ enum class Usb3Switch {
+ const char *usb3_switch_name(Usb3Switch r);
+ 
+ // The adapter at bus/port (port path "1" or "1.2"). Opens it briefly; nothing else may hold it.
+-Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr);
++// force (Play League): switch even when the chip looks like it already tried (USB23_SW_MODE already 2). A chip
++// can power up that way without having tried (seen on a Mac); a link without USB 3 lines just comes back at USB 2.
++Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr,
++                        bool force = false);
+ // Back to USB 2 without a replug (the vendor driver's 3 -> 2 switch; tests of the USB 2 paths). The
+ // chip then comes up at USB 2, and request_usb3 can switch it again.
+ Usb3Switch request_usb2(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr);

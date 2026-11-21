@@ -39,9 +39,11 @@ struct Hump {
 std::vector<Hump> find_humps(const std::vector<float> &db, double fs, double edge_hz);
 
 // Live SNR of the carrier being watched (dB): the strongest point of the smoothed spectrum against the noise
-// floor (10th percentile) inside +-span_hz, the band the RX filter passes. Comparable with Hump::snr_db for a
-// signal that leaves part of the span free; a very wide, close signal reads lower.
-float carrier_snr(const std::vector<float> &db, double fs, double span_hz);
+// floor (10th percentile) inside +-span_hz of the carrier, which sits carrier_hz from the stream centre (0 unless
+// the hardware centre is put beside it). pass_hz > 0 also keeps the span inside +-pass_hz of the stream centre, the
+// band the RX filter passes (an offset carrier's span would reach past it otherwise). Comparable with
+// Hump::snr_db for a signal that leaves part of the span free; a very wide, close signal reads lower.
+float carrier_snr(const std::vector<float> &db, double fs, double span_hz, double carrier_hz = 0, double pass_hz = 0);
 
 // Sync check: is there analog video at this offset? Runs a FrontEnd over the samples.
 struct VideoCheck {

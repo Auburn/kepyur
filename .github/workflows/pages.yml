@@ -10,6 +10,7 @@ on:
       - 'web/**'
       - 'native/**'
       - 'third_party/**'
+      - 'patches/**'
       - 'scripts/build-web.sh'
       - 'shell.nix'
       - '.github/workflows/pages.yml'

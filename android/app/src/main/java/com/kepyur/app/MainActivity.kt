@@ -2,138 +2,168 @@ package com.kepyur.app
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.AlertDialog
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
-import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.widget.Button
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Switch
-import android.widget.TextView
 import org.json.JSONObject
-import java.util.concurrent.Executors
+import java.io.File
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
- * kepyur: one screen. Video always fills the screen (4:3, centred); the pilot list docks on the right
- * while scanning and slides away when a pilot is picked; a swipe in from the right edge (or the handle)
- * brings it back.
+ * kepyur: one screen. The picture fills it; the menu ([MenuView]) lies over the picture, blurred behind it,
+ * and is open when the app starts. With the menu closed there is nothing on screen but the picture: a tap
+ * brings up a MENU button for three seconds.
  *
- * Test mode (for the first hardware check):  adb shell am start -n com.kepyur.app/.MainActivity --es mode usbtest
+ * USB stream test (for the first hardware check):  adb shell am start -n com.kepyur.app/.MainActivity --es mode usbtest
  */
-class MainActivity : Activity() {
-    private val tag = "kepyur"
-    private val ui = Handler(Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor()
-    private lateinit var usb: UsbManager
+/**
+ * Where the log and the recordings go: the app's folder on shared storage (Android/data/com.kepyur.app/files,
+ * readable over USB without root), or its private folder when shared storage is not there. Android answers null
+ * then, which happens: for the first seconds after a boot, and whenever the volume is not mounted.
+ */
+internal fun Context.dataDir(): File = getExternalFilesDir(null) ?: filesDir
 
-    private enum class State { NO_ADAPTER, PERMISSION, SWITCHING, OPENING, RUNNING, USB2, ERROR }
-    private var state = State.NO_ADAPTER
-    private var errorText = ""
-    private var device: UsbDevice? = null
-    private var conn: UsbDeviceConnection? = null
-    private var expectReenumerate = false
-    private var mode = "normal"
+class MainActivity : Activity(), MenuView.Listener, UsbLink.Events {
+    private val ui = Handler(Looper.getMainLooper())
+    private val engine = Engine.get()
+    private lateinit var settings: Settings
+    private lateinit var link: UsbLink
+
+    private lateinit var root: FrameLayout
+    private lateinit var video: SurfaceView
+    private lateinit var menu: MenuView
+    private lateinit var hint: MenuHint
+    private var menuOpen = true
+    /**
+     * The menu opened itself, because there was no picture to show and a reason to give (the adapter gone, a
+     * radio being started again): it closes itself when the picture is back, unless it has been touched since.
+     */
+    private var menuAuto = false
+    private var foreground = false
+    private var wasRunning = false
+    private val surfaceToken = Any()
+
+    // what the radio last said
+    private var mode = ""
+    private var found: List<Found> = emptyList()
+    private var noVideoFound = false       // the last scan came back empty
+    private var lastDropped = 0L
+    private var overloadedUntil = 0L
+    // blocks the adapter's stream gave up on (collected too late): the count at the last refresh, when that was
+    // and whether the radio was watching then, and for each rise seen while watching in the last LATE_WINDOW_MS,
+    // when and by how many (see refresh())
+    private var lastLate = 0L
+    private var lastLateAt = 0L
+    private var lastLateWatching = false
+    private val lateMarks = ArrayDeque<Pair<Long, Long>>()
+    private var frameRateFor = ""
+    private var appliedRate = 0
+    private var scanOnReturn = false       // a scan is owed: the first one, or one the background cut short
+    private var scanStartedAt = 0L         // when the last scan began (elapsedRealtime); 0: none this session
+    private var statusBroken = false
+
+    // USB stream test
     private val testPlan = ArrayDeque<Pair<Int, Double>>()
     private var testRunning = false
     private val testResults = mutableListOf<String>()
-
-    // views
-    private lateinit var root: FrameLayout
-    private lateinit var videoFrame: AspectFrame
-    private lateinit var video: SurfaceView
-    private lateinit var label: TextView
-    private lateinit var centre: TextView
-    private lateinit var panel: LinearLayout
-    private lateinit var panelHeader: TextView
-    private lateinit var pilotRows: LinearLayout
-    private lateinit var handle: TextView
-    private var panelShown = true
-    private var lastLabelTouch = 0L
-    private var lastPilotsJson = ""
-    private var watchingHz = 0.0
-
-    private val permAction = "com.kepyur.app.USB_PERMISSION"
+    private var testRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        usb = getSystemService(USB_SERVICE) as UsbManager
-        mode = intent?.getStringExtra("mode") ?: "normal"
-        Native.init(getExternalFilesDir(null)!!.absolutePath + "/kepyur.log")
-        Native.setComb(prefs().getBoolean("comb", false))  // the native Radio lives for the whole process
-        Native.log("start, mode=$mode, ${Build.MANUFACTURER} ${Build.MODEL} Android ${Build.VERSION.RELEASE}")
+        settings = Settings(this)
+        engine.init(dataDir().absolutePath + "/kepyur.log")
+        engine.log("start, ${Build.MANUFACTURER} ${Build.MODEL} Android ${Build.VERSION.RELEASE}")
+        applyPicture()
+        applySignal()
+        applyView()
+        engine.setBackdrop(true, true)
         buildUi()
-        val f = IntentFilter().apply {
-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(usbReceiver, f, RECEIVER_EXPORTED)
-            registerReceiver(permReceiver, IntentFilter(permAction), RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(usbReceiver, f)
-            registerReceiver(permReceiver, IntentFilter(permAction))
-        }
-        ui.post(poll)
-        connect()
-        intent?.let { debugExtras(it) }
+        link = UsbLink(this, engine, this)
+        handleIntent(intent)
+        link.start()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        intent.getStringExtra("mode")?.let { mode = it }
-        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) connect()
-        debugExtras(intent)
+        handleIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) link.onAttachedIntent()
     }
 
-    /** adb shell am start -n com.kepyur.app/.MainActivity --ei watchrate 1|2 --ef gain 30 --ez comb true --ef record 3 */
-    private fun debugExtras(i: Intent) {
-        if (i.hasExtra("gain")) {
-            val g = i.getFloatExtra("gain", -1f).toDouble()
-            Native.setGain(g)
-            Native.log("debug: gain ${if (g < 0) "AGC" else "$g dB"}")
-            if (watchingHz > 0 && state == State.RUNNING && !i.hasExtra("watchrate")) Native.watch(watchingHz)
+    /**
+     * adb shell am start -n com.kepyur.app/.MainActivity [--es mode usbtest] [--ef gain 30] [--ef record 3] [--ez testcard true]
+     * USB debugging: [--es env WSDR_URB_DEPTH=64,OTHER=1] (wifi-sdr / devourer switches, read at the next open or stream
+     * start; KEY= removes one), [--ez soak true] (a 40 MS/s stream test after every open instead of watching: how long
+     * the link holds up, open after open).
+     */
+    private fun handleIntent(i: Intent?) {
+        i ?: return
+        if (i.hasExtra("testcard")) engine.testCard(i.getBooleanExtra("testcard", false))
+        i.getStringExtra("env")?.split(',')?.forEach { kv ->
+            val k = kv.substringBefore('=').trim()
+            if (k.isNotEmpty()) engine.setDebugEnv(k, kv.substringAfter('=', "").trim())
         }
-        if (i.hasExtra("comb")) {
-            val on = i.getBooleanExtra("comb", false)
-            Native.setComb(on)
-            Native.log("debug: comb ${if (on) "on" else "off"}")
-            if (watchingHz > 0 && state == State.RUNNING && !i.hasExtra("watchrate")) Native.watch(watchingHz)
+        if (i.hasExtra("soak")) {
+            soak = i.getBooleanExtra("soak", false)
+            engine.log("debug: soak $soak")
         }
-        if (i.hasExtra("watchrate")) {
-            val r = i.getIntExtra("watchrate", 2)
-            Native.setWatchRate(r)
-            Native.log("debug: watch rate_sel $r")
-            if (watchingHz > 0 && state == State.RUNNING) Native.watch(watchingHz)
+        if (i.getStringExtra("mode") == "usbtest") {
+            testRequested = true
+            if (::link.isInitialized && link.state == UsbLink.State.RUNNING) startTest()
+        }
+        if (i.hasExtra("gain")) {   // the same as the menu's Gain: below 0 automatic, else that many dB
+            val g = i.getFloatExtra("gain", -1f)
+            settings.gainAuto = g < 0
+            if (g >= 0) settings.gainDb = g.coerceAtMost(Settings.GAIN_MAX)
+            settings.save()
+            engine.log("debug: gain ${if (g < 0) "automatic" else "$g dB"}")
+            if (::menu.isInitialized) menu.syncGain()
+            applySignal()
+            retune()
         }
         if (i.hasExtra("record")) {
             val secs = i.getFloatExtra("record", 3f).toDouble()
             val name = "rec-" + java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(java.util.Date())
-            Native.record(secs, getExternalFilesDir(null)!!.absolutePath + "/" + name)
+            engine.record(secs, dataDir().absolutePath + "/" + name)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        foreground = true
+        ui.removeCallbacks(closeInBackground)
+        ui.removeCallbacks(poll)
+        ui.post(poll)
+        if (!link.started) {
+            // the adapter was let go in the background: it takes a few seconds to come back (onRadioUp then
+            // tunes), and until then the menu says so instead of a black screen saying nothing
+            link.start()
+            showMenuForTrouble()
+        }
+        // back from the background, where decoding was stopped
+        if (link.state == UsbLink.State.RUNNING) {
+            if (!testRunning) {
+                if (scanOnReturn) onScan() else if (mode == "idle") tune(fresh = true)
+            }
+        } else {
+            showMenuForTrouble()   // the adapter went, or the radio died, while nobody was looking
         }
     }
 
@@ -142,431 +172,502 @@ class MainActivity : Activity() {
         hideSystemBars()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    override fun onStop() {
+        foreground = false
+        ui.removeCallbacks(poll)
+        // nobody is watching: no reason to keep two cores decoding
+        if (link.state == UsbLink.State.RUNNING && !testRunning) {
+            if (mode == "scan") scanOnReturn = true   // cut short: start it over when the app is back
+            engine.idle()
+            mode = "idle"
+        }
+        // ... nor, after a while, to keep the adapter streaming and warm: it is opened again on return
+        if (!testRunning) ui.postDelayed(closeInBackground, BACKGROUND_CLOSE_MS)
+        super.onStop()
+    }
+
+    private val closeInBackground = Runnable {
+        engine.log("in the background for ${BACKGROUND_CLOSE_MS / 1000} s: closing the adapter")
+        link.stop()
+        mode = ""
+        wasRunning = false
+    }
+
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
-        unregisterReceiver(usbReceiver)
-        unregisterReceiver(permReceiver)
-        worker.execute { Native.close() }
-        conn?.close()
+        link.stop()
         super.onDestroy()
     }
 
-    // ---------------------------------------------------------------------------------------- USB
-    private fun ours(d: UsbDevice) = // T4U v3, T3U, T3U Plus; Realtek's own 8812BU id
-        (d.vendorId == 0x2357 && d.productId in setOf(0x0115, 0x012d, 0x0138)) ||
-            (d.vendorId == 0x0bda && d.productId == 0xb812)
-
-    private fun connect() {
-        if (state == State.OPENING || state == State.RUNNING) return
-        val d = usb.deviceList.values.firstOrNull { ours(it) }
-        if (d == null) {
-            setState(if (expectReenumerate) State.SWITCHING else State.NO_ADAPTER)
-            return
-        }
-        device = d
-        if (!usb.hasPermission(d)) {
-            setState(State.PERMISSION)
-            val pi = PendingIntent.getBroadcast(
-                this, 0, Intent(permAction).setPackage(packageName),
-                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            )
-            usb.requestPermission(d, pi)
-            return
-        }
-        val c = usb.openDevice(d)
-        if (c == null) {
-            fail("Could not open the adapter (is another app using it?)")
-            return
-        }
-        conn = c
-        val fd = c.fileDescriptor
-        Native.log("adapter ${d.deviceName} ${"%04x:%04x".format(d.vendorId, d.productId)} fd=$fd")
-        setState(State.OPENING)
-        worker.execute {
-            val sw = Native.usb3Switch(fd)
-            if (sw.startsWith("requested")) {
-                // the adapter drops off the bus and comes back as SuperSpeed: a new device, a new permission
-                ui.post {
-                    expectReenumerate = true
-                    c.close(); conn = null
-                    setState(State.SWITCHING)
-                    ui.postDelayed({ if (state == State.SWITCHING) connect() }, 4000)
-                }
-                return@execute
-            }
-            val err = Native.open(fd)
-            ui.post {
-                expectReenumerate = false
-                when {
-                    err.isNotEmpty() -> fail("Radio did not start: $err")
-                    !Native.superspeed() -> setState(State.USB2)
-                    else -> {
-                        setState(State.RUNNING)
-                        startWork()
-                    }
-                }
-            }
-        }
+    /** Back goes up: from the picture to the menu, from the menu out of the app. */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (menuOpen) {
+            @Suppress("DEPRECATION") super.onBackPressed()
+        } else openMenu()
     }
 
-    private fun startWork() {
-        if (mode == "usbtest") {
-            testPlan.clear(); testResults.clear()
+    // ---------------------------------------------------------------------------------------- settings -> native
+    private fun applyPicture() {
+        engine.setPicture(settings.lumaComb, settings.lumaComb && settings.cleanOsd, settings.smoothLines, settings.sparkleRepair)
+        engine.setComb(settings.colourComb)
+    }
+
+    /** True when something changed that only a new tune applies. */
+    private fun applySignal(): Boolean {
+        // only when it changed: setting the rate also forgets that 40 had to fall back to 20
+        val rate = if (settings.rate40) 1 else 2
+        if (rate != appliedRate) engine.setWatchRate(rate)
+        appliedRate = rate
+        engine.setGain(if (settings.gainAuto) -1.0 else settings.gainDb.toDouble())
+        engine.setDiversity(settings.diversity)
+        return engine.setOffsetTuning(settings.offsetTune)
+    }
+
+    private fun applyView() =
+        engine.setView(settings.aspect, settings.fit, settings.scale, settings.goggles, settings.eyeShift)
+
+    /** The frequency for the chosen channel: where a scan measured its transmitter, if it found one, else the nominal one. */
+    private fun channelHz(): Double {
+        val mhz = settings.channelMhz
+        if (mhz <= 0) return 0.0
+        val seen = found.filter { abs(it.mhz - mhz) < Channels.SAME_CHANNEL_MHZ }.maxByOrNull { it.snrDb }
+        return (seen?.mhz ?: mhz.toDouble()) * 1e6
+    }
+
+    private fun tune(fresh: Boolean) {
+        if (link.state != UsbLink.State.RUNNING || testRunning) return
+        val hz = channelHz()
+        if (hz <= 0) return
+        noVideoFound = false
+        scanOnReturn = false   // a channel has been chosen since: no scan is owed any more
+        engine.watch(hz, fresh)
+        mode = "watch"
+    }
+
+    /** The same channel again, for a setting that only takes effect on a tune. */
+    private fun retune() {
+        if (mode == "watch") tune(fresh = false)
+    }
+
+    // ---------------------------------------------------------------------------------------- MenuView.Listener
+    override fun onTune() = tune(fresh = true)
+
+    override fun onScan() {
+        if (link.state != UsbLink.State.RUNNING || testRunning) return
+        scanOnReturn = false
+        noVideoFound = false
+        scanStartedAt = android.os.SystemClock.elapsedRealtime()
+        found = emptyList()   // what earlier scans saw is history: this one starts from nothing
+        engine.scan(channelHz())
+        mode = "scan"
+        refresh()
+    }
+
+    override fun onView() = applyView()
+
+    override fun onPicture(rebuild: Boolean) {
+        applyPicture()
+        if (rebuild) retune()
+    }
+
+    override fun onSignal(retune: Boolean) {
+        applySignal()
+        if (retune) retune()
+    }
+
+    /** A view slider is being dragged: the picture sharp under it, so the change can be judged. */
+    override fun onPeek(on: Boolean) = engine.setBackdrop(menuOpen && !on, false)
+
+    /** A finger on the menu: whoever opened it, it now stays until it is closed. */
+    override fun onTouched() {
+        menuAuto = false
+    }
+
+    override fun onStatusAction() = link.retryNow()
+
+    override fun onClose() = closeMenu()
+
+    // ---------------------------------------------------------------------------------------- UsbLink.Events
+    override fun onLinkChanged() {
+        val running = link.state == UsbLink.State.RUNNING
+        if (!running) {
+            mode = ""
+            testRunning = false
+            // the picture has just gone, with nothing on screen to say why: the menu does (and steps aside
+            // again by itself once the radio is back, see onRadioUp). Not for the few seconds of a reopen after the
+            // USB data path wedged: on some phones that comes every minute or so, and fixes itself.
+            if (wasRunning && foreground && !link.reopeningAfterWedge) showMenuForTrouble()
+        }
+        wasRunning = running
+        refresh()
+    }
+
+    private fun showMenuForTrouble() {
+        if (menuOpen || !::menu.isInitialized) return
+        openMenu()
+        menuAuto = true
+    }
+
+    override fun onRadioUp() {
+        applyPicture()
+        applySignal()
+        lastDropped = 0
+        lastLate = 0
+        lastLateWatching = false
+        lateMarks.clear()
+        if (menuAuto) closeMenu()   // it only came up to say the picture was away
+        when {
+            testRequested || soak -> startTest()
+            !foreground -> {   // it came up with nobody watching: wait, and on return tune, or scan if this is the first run
+                engine.idle()
+                mode = "idle"
+                scanOnReturn = settings.channelMhz <= 0
+            }
+            scanOnReturn -> onScan()   // one was cut short before the adapter was let go
+            settings.channelMhz > 0 -> tune(fresh = true)
+            else -> onScan()   // first run: find something to show
+        }
+        refresh()
+    }
+
+    // ---------------------------------------------------------------------------------------- USB stream test
+    private fun startTest() {
+        testRequested = false
+        testPlan.clear(); testResults.clear()
+        if (soak) {
+            testPlan.add(1 to SOAK_S)   // 40 MS/s until it fails (the next open starts another)
+        } else {
             testPlan.add(1 to 60.0)   // 40 MS/s for 60 s
             testPlan.add(2 to 60.0)   // 20 MS/s for 60 s
-            nextTest()
-        } else {
-            Native.scan()
-            showPanel(true)
         }
+        nextTest()
     }
 
     private fun nextTest() {
         val t = testPlan.removeFirstOrNull()
         if (t == null) {
             testRunning = false
-            Native.log("usbtest: all done: ${testResults.joinToString(" | ")}")
-            Native.log("usbtest: now decoding for the rest of the session (scan, then watch)")
-            mode = "normal"
-            Native.scan()
-            showPanel(true)
+            engine.log("usbtest: all done: ${testResults.joinToString(" | ")}")
+            engine.log("usbtest: now decoding for the rest of the session")
+            applySignal()
+            if (settings.channelMhz > 0) tune(fresh = true) else onScan()
             return
         }
         testRunning = true
-        Native.log("usbtest: rate_sel ${t.first} for ${t.second} s")
-        Native.streamTest(t.first, t.second)
+        engine.log("usbtest: rate_sel ${t.first} for ${t.second} s")
+        engine.streamTest(t.first, t.second)
+        mode = "test"
     }
 
-    private fun closeRadio() {
-        worker.execute { Native.close() }
-        conn?.close(); conn = null
-    }
-
-    private val usbReceiver = object : BroadcastReceiver() {
-        override fun onReceive(ctx: Context, i: Intent) {
-            val d: UsbDevice? = if (Build.VERSION.SDK_INT >= 33)
-                i.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-            else @Suppress("DEPRECATION") i.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-            if (d == null || !ours(d)) return
-            when (i.action) {
-                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    Native.log("adapter detached${if (expectReenumerate) " (USB 3 switch)" else ""}")
-                    if (state == State.RUNNING || state == State.OPENING || state == State.USB2) closeRadio()
-                    if (!expectReenumerate) setState(State.NO_ADAPTER)
-                }
-                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    Native.log("adapter attached")
-                    if (state != State.RUNNING && state != State.OPENING) {
-                        state = State.NO_ADAPTER
-                        connect()
-                    }
-                }
-            }
-        }
-    }
-
-    private val permReceiver = object : BroadcastReceiver() {
-        override fun onReceive(ctx: Context, i: Intent) {
-            val ok = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            Native.log("usb permission ${if (ok) "granted" else "denied"}")
-            if (ok) {
-                state = State.NO_ADAPTER
-                connect()
-            } else fail("USB permission denied. Unplug and replug the adapter to try again.")
-        }
-    }
-
-    private fun fail(msg: String) {
-        errorText = msg
-        Native.log("error: $msg")
-        setState(State.ERROR)
-    }
-
-    // ---------------------------------------------------------------------------------------- polling
+    // ---------------------------------------------------------------------------------------- status
     private val poll = object : Runnable {
         override fun run() {
-            if (state == State.RUNNING || state == State.USB2) render(JSONObject(Native.status()))
-            if (System.currentTimeMillis() - lastLabelTouch > 4000 && label.alpha > 0f && !panelShown)
-                label.animate().alpha(0f).setDuration(400).start()
+            refresh()
             ui.postDelayed(this, 250)
         }
     }
 
-    private fun render(s: JSONObject) {
-        val m = s.optString("mode")
-        val video = s.optJSONObject("video")
-        val locked = video?.optBoolean("locked") ?: false
-        watchingHz = if (m == "watch") s.optDouble("watch_hz") else watchingHz
-        // centre message
-        val msg = when {
-            state == State.USB2 -> "The adapter is running at USB 2.\nVideo needs USB 3: use the phone's USB-C port directly with a USB 3 OTG adapter or cable."
-            m == "test" -> {
-                val t = s.optJSONObject("test")
-                "USB test  " + (t?.let { "%.0f MS/s  %.0f s  banks %d / %d  gaps %d  restarts %d  dropped %d".format(
-                    it.optDouble("rate_msps"), it.optDouble("seconds"), it.optLong("banks"), it.optLong("expected"),
-                    it.optLong("seq_gaps"), it.optLong("restarts"), it.optLong("queue_dropped")) } ?: "starting…")
-            }
-            m == "scan" -> "Scanning…  ${s.optInt("scan_step")}/${s.optInt("scan_steps")}"
-            m == "watch" && !locked -> "Searching for the picture…"
-            m == "idle" && s.optJSONArray("pilots")?.length() == 0 -> "No pilots found.\nOpen the list and tap Rescan."
-            else -> ""
+    private fun refresh() {
+        if (!::menu.isInitialized) return
+        val st = if (link.state == UsbLink.State.RUNNING) radioState() else linkState()
+        if (menuOpen) menu.render(st)
+    }
+
+    /**
+     * A number from the status, or [or] when it is missing or not a finite number. (The native side prints
+     * doubles as they come, and Android's JSON reader takes a bare nan or inf for a string without complaint.)
+     */
+    private fun JSONObject.num(key: String, or: Double = 0.0): Double = optDouble(key, or).let { if (it.isFinite()) it else or }
+
+    private fun linkState(): MenuState = linkHeadline().let { st ->
+        // the rail may have to cut a long message short on a small screen: the Signal tab shows all of it
+        if (st.tone == Tone.WARN || st.tone == Tone.ERROR) st.copy(stats = st.detail) else st
+    }
+
+    private fun linkHeadline(): MenuState = when (link.state) {
+        UsbLink.State.NO_ADAPTER -> MenuState(Tone.IDLE, "No adapter", "Plug the Wi-Fi adapter into the phone's USB port.")
+        UsbLink.State.PERMISSION -> MenuState(Tone.BUSY, "Allow USB access", "Android is asking whether Kepyur may use the adapter.")
+        UsbLink.State.DENIED -> MenuState(Tone.WARN, "Permission needed", "Kepyur cannot use the adapter without it.", "Ask again")
+        UsbLink.State.SWITCHING -> MenuState(Tone.BUSY, "Switching to USB 3", "The adapter restarts itself. This takes a few seconds.")
+        UsbLink.State.OPENING -> MenuState(Tone.BUSY, "Starting the radio", link.message.ifEmpty { "About five seconds." })
+        UsbLink.State.WAITING -> MenuState(Tone.WARN, "Trying again", link.message, "Try now")
+        UsbLink.State.FAILED -> MenuState(Tone.ERROR, "Adapter problem", link.message, "Try again")
+        UsbLink.State.USB2 -> MenuState(Tone.WARN, "USB 2 link",
+            "Video needs USB 3. Plug the adapter straight into the phone with a USB 3 (OTG) adapter or cable.", "Try again")
+        UsbLink.State.RUNNING -> MenuState()
+    }
+
+    private fun radioState(): MenuState {
+        // a number the native side could not print as JSON (nan, inf) must not take the app down with it
+        val s = try {
+            JSONObject(engine.status())
+        } catch (e: org.json.JSONException) {
+            if (!statusBroken) engine.log("status: unreadable ($e)")
+            statusBroken = true
+            return MenuState(Tone.BUSY, "Working", radioReady = !testRunning, found = found)
         }
-        centre.text = msg
-        centre.visibility = if (msg.isEmpty()) View.GONE else View.VISIBLE
-        // test sequencing
-        if (testRunning && m == "idle") {
+        statusBroken = false
+        link.check(s)
+        if (link.state != UsbLink.State.RUNNING) return linkState()
+        val was = mode
+        mode = s.optString("mode")
+        val radioMode = mode   // what the radio says it is doing; `mode` may move on below (the end of a stream test tunes)
+        val v = s.optJSONObject("video")
+        val locked = v?.optBoolean("locked") ?: false
+        val watchHz = s.num("watch_hz")
+
+        // The radio remembers every signal it has ever seen; what the menu shows as found is what the last scan
+        // saw (a transmitter that has since landed is not "found", and its old frequency is no guide to tuning).
+        val sinceScan = android.os.SystemClock.elapsedRealtime() - scanStartedAt
+        found = if (scanStartedAt == 0L) emptyList() else buildList {
+            val arr = s.optJSONArray("pilots") ?: return@buildList
+            for (i in 0 until arr.length()) {
+                val p = arr.optJSONObject(i) ?: continue
+                val mhz = p.num("mhz")
+                val seenInThisScan = p.optLong("age_s") * 1000 <= sinceScan + 1500
+                if (mhz > 0 && seenInThisScan) add(Found(mhz, p.optString("name"), p.num("snr").toFloat(), p.optString("std")))
+            }
+        }
+        // a scan has just ended: it left the radio on the channel it judged best, and the picker follows
+        if (was == "scan" && mode != "scan") {
+            noVideoFound = found.isEmpty()
+            if (mode == "watch") adoptChannel(watchHz / 1e6)
+        }
+        if (testRunning && mode == "idle") {
             s.optJSONObject("test")?.let { if (it.optBoolean("done")) { testResults.add(it.toString()); nextTest() } }
         }
-        // label
-        val p = currentPilot(s)
-        val lockTxt = if (m == "watch") (if (locked) "● locked" else "○ searching") else m
-        label.text = buildString {
-            if (p != null) append(p.optString("name").ifEmpty { "—" }).append(" · ")
-            if (m == "watch") append("%.0f MHz · ".format(watchingHz / 1e6))
-            append(lockTxt)
-            if (m == "watch" && locked) append(" · %.0f fps".format(video?.optDouble("fps") ?: 0.0))
-            val load = s.optDouble("dsp_load")
-            val dropped = s.optLong("dropped")
-            if (load > 0.8 || dropped > 0) append("  [cpu %.0f%%, dropped %d]".format(load * 100, dropped))
+        if (mode == "watch" && locked) {
+            matchDisplayTo(v?.optString("std") ?: "")
+            noVideoFound = false   // there is a picture after all: what the scan missed no longer matters
         }
-        label.setTextColor(if (locked) Color.WHITE else Color.rgb(255, 200, 120))
-        // pilot list
-        val pilots = s.optJSONArray("pilots")
-        val pj = (pilots?.toString() ?: "") + m + watchingHz
-        panelHeader.text = if (m == "scan") "Pilots   scanning ${s.optInt("scan_step")}/${s.optInt("scan_steps")}" else "Pilots"
-        if (pj != lastPilotsJson) {
-            lastPilotsJson = pj
-            pilotRows.removeAllViews()
-            if (pilots != null) for (i in 0 until pilots.length()) pilotRows.addView(pilotRow(pilots.getJSONObject(i), m))
+
+        // Is the phone keeping up? A block lost in the queue behind the USB link or before the decoder, or a thread
+        // with no time to spare, says no at once. A block the adapter's stream itself gave up on (collected too
+        // late) does not: any phone stalls for a moment now and then, a few times a minute. LATE_BLOCKS of them
+        // seen within LATE_WINDOW_MS do (a block counts from the refresh that first shows it, up to a poll late).
+        // Only those of a watch that this screen has been following count: a rise between two refreshes that both
+        // found the radio watching. The ones a scan or a stream test left behind (up to its last moments, after
+        // the last refresh that saw it), or that came in while nothing was refreshed (the app in the background:
+        // the adapter streams on for a while), say nothing about the picture now: the count is then only taken
+        // note of. So is whatever comes in before the first refresh of a watch (up to a poll's length, the
+        // retune into it included): a phone that is not keeping up goes on losing blocks after that.
+        val now = android.os.SystemClock.elapsedRealtime()
+        val late = s.optLong("stream_dropped")
+        val queued = s.optLong("dropped") + s.optLong("decode_dropped")
+        val dropped = late + queued   // lost anywhere on the way, for the figures on the Signal tab
+        val load = maxOf(s.num("dsp_load"), s.num("decode_load"))
+        val followed = radioMode == "watch" && lastLateWatching && late >= lastLate && now - lastLateAt <= LATE_GAP_MS
+        if (!followed) lateMarks.clear()
+        else if (late > lastLate) lateMarks.addLast(now to late - lastLate)
+        while (lateMarks.isNotEmpty() && now - lateMarks.first().first > LATE_WINDOW_MS) lateMarks.removeFirst()
+        val lateBurst = followed && late > lastLate && lateMarks.sumOf { it.second } >= LATE_BLOCKS
+        lastLate = late
+        lastLateAt = now
+        lastLateWatching = radioMode == "watch"
+        if (mode == "watch" && (queued > lastDropped || load > 0.95 || lateBurst)) overloadedUntil = now + 5000
+        lastDropped = queued
+        val overloaded = mode == "watch" && now < overloadedUntil
+
+        val name = Channels.nearest(watchHz / 1e6, settings.band, Channels.SAME_CHANNEL_MHZ)?.name
+        val where = (if (name != null) "$name · " else "") + "${(watchHz / 1e6).roundToInt()} MHz"   // finite: num()
+        val stats = buildString {
+            append(if (s.optBoolean("usb3")) "USB 3" else "USB 2")
+            val msps = s.num("watch_msps")
+            if (msps > 0) append(" · %.0f MS/s".format(msps))
+            if (s.optBoolean("fallback")) append(" (40 kept dropping out)")
+            append(" · processing %.0f%%".format(load * 100))
+            append(" · $dropped dropped · ${s.optLong("restarts")} restarts")
+            s.optJSONObject("antennas")?.let { a ->
+                if (a.optBoolean("combine")) append("\nAntenna A %.0f dB · B %.0f dB · together %.0f dB".format(
+                    a.num("snr_a"), a.num("snr_b"), a.num("snr_c")))
+            }
+        }
+        val base = MenuState(radioReady = !testRunning, scanning = mode == "scan", scanStep = s.optInt("scan_step"),
+            scanSteps = s.optInt("scan_steps"), found = found, scanFoundNothing = noVideoFound, stats = stats)
+        return when (mode) {
+            "scan" -> base.copy(tone = Tone.BUSY, headline = "Scanning", detail = "Looking for video on every channel.")
+            "test" -> {
+                val t = s.optJSONObject("test")
+                base.copy(tone = Tone.BUSY, headline = "USB test", detail = t?.let {
+                    "%.0f MS/s · %.0f s\n%d of %d blocks · %d gaps · %d restarts".format(it.num("rate_msps"), it.num("seconds"),
+                        it.optLong("banks"), it.optLong("expected"), it.optLong("seq_gaps"), it.optLong("restarts"))
+                } ?: "Starting…")
+            }
+            "watch" -> when {
+                overloaded -> OVERLOAD_ADVICE.let { advice ->   // in full on the Signal tab: the rail may cut it short
+                    base.copy(tone = Tone.WARN, headline = where, detail = advice, stats = "$advice\n$stats")
+                }
+                locked -> base.copy(tone = Tone.LIVE, headline = where, detail = buildString {
+                    append(v?.optString("std") ?: "")
+                    if (v?.optBoolean("colour") == false) append(" · black and white")
+                    append(" · %.0f fps".format(v?.num("fps") ?: 0.0))
+                    if (s.has("snr_db")) append(" · %.0f dB".format(s.num("snr_db")))
+                })
+                noVideoFound -> base.copy(tone = Tone.BUSY, headline = where,
+                    detail = "The scan found no video. Still looking on this channel…")
+                else -> base.copy(tone = Tone.BUSY, headline = where, detail = "Looking for a picture…")
+            }
+            else -> base.copy(tone = Tone.IDLE, headline = "Ready",
+                detail = if (noVideoFound) "The scan found no video. Pick a channel, or scan again." else "Pick a channel, or scan.")
         }
     }
 
-    private fun currentPilot(s: JSONObject): JSONObject? {
-        val pilots = s.optJSONArray("pilots") ?: return null
-        for (i in 0 until pilots.length()) {
-            val p = pilots.getJSONObject(i)
-            if (abs(p.optDouble("mhz") * 1e6 - watchingHz) < 4e6) return p
+    /** The radio is on [mhz] by its own choice (after a scan): the picker and the saved channel follow. */
+    private fun adoptChannel(mhz: Double) {
+        if (!mhz.isFinite() || mhz <= 0) return
+        // a transmitter further than that from a channel is not on it: it is kept by its own frequency
+        val ch = Channels.nearest(mhz, settings.band, Channels.SAME_CHANNEL_MHZ)
+        val to = ch?.mhz ?: mhz.roundToInt()
+        if (to == settings.channelMhz && (ch == null || ch.band == settings.band)) return
+        settings.channelMhz = to
+        if (ch != null) settings.band = ch.band
+        settings.save()
+        menu.syncChannel()
+    }
+
+    /** Ask for a display mode that fits the camera's field rate, so frames do not beat against the refresh. */
+    private fun matchDisplayTo(std: String) {
+        if (Build.VERSION.SDK_INT < 30 || std == frameRateFor) return
+        val rate = when (std) { "PAL" -> 50f; "NTSC" -> 59.94f; else -> return }
+        val surface = video.holder.surface ?: return
+        if (!surface.isValid) return
+        frameRateFor = std
+        try {
+            surface.setFrameRate(rate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        } catch (e: Exception) {
+            engine.log("setFrameRate: $e")
         }
-        return null
     }
 
     // ---------------------------------------------------------------------------------------- UI
-    private fun dp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics)
-    private fun dpi(v: Float) = dp(v).toInt()
-
-    private fun setState(s: State) {
-        state = s
-        val msg = when (s) {
-            State.NO_ADAPTER -> "Plug in the adapter."
-            State.PERMISSION -> "Allow kepyur to use the adapter."
-            State.SWITCHING -> "Switching the adapter to USB 3…"
-            State.OPENING -> "Starting the radio…"
-            State.ERROR -> errorText
-            State.USB2, State.RUNNING -> centre.text.toString()
-        }
-        centre.text = msg
-        centre.visibility = if (msg.isEmpty()) View.GONE else View.VISIBLE
-        if (s != State.RUNNING) {
-            label.text = ""
-            lastPilotsJson = ""
-        }
-    }
+    private fun dp(v: Float) = v * resources.displayMetrics.density
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        videoFrame = AspectFrame(this, 4f / 3f)
         video = SurfaceView(this)
         video.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(h: SurfaceHolder) = Native.setSurface(h.surface)
-            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) = Native.setSurface(h.surface)
-            override fun surfaceDestroyed(h: SurfaceHolder) = Native.setSurface(null)
+            override fun surfaceCreated(h: SurfaceHolder) {
+                frameRateFor = ""
+                surfaceOwner = surfaceToken
+                engine.setSurface(h.surface)
+            }
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) = engine.redraw()
+            override fun surfaceDestroyed(h: SurfaceHolder) {
+                // the native screen is one for the process: an earlier activity, going away late, must not take
+                // the Surface of the one that has replaced it
+                if (surfaceOwner !== surfaceToken) return
+                surfaceOwner = null
+                engine.setSurface(null)
+            }
         })
-        videoFrame.addView(video, FrameLayout.LayoutParams(-1, -1))
-        root.addView(videoFrame, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        root.addView(video, FrameLayout.LayoutParams(-1, -1))
 
-        label = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setPadding(dpi(10f), dpi(5f), dpi(10f), dpi(5f))
-            background = rounded(Color.argb(150, 0, 0, 0), 8f)
+        hint = MenuHint(this).apply {
+            alpha = 0f
+            visibility = View.GONE
+            setOnClickListener { openMenu() }
         }
-        root.addView(label, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
-            setMargins(dpi(16f), dpi(12f), 0, 0)
-        })
+        root.addView(hint, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            .apply { bottomMargin = dp(30f).roundToInt() })
 
-        centre = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            gravity = Gravity.CENTER
-            setPadding(dpi(18f), dpi(12f), dpi(18f), dpi(12f))
-            background = rounded(Color.argb(170, 0, 0, 0), 10f)
-        }
-        root.addView(centre, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        menu = MenuView(this, settings, this)
+        root.addView(menu, FrameLayout.LayoutParams(-1, -1))
 
-        // pilot panel
-        panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(225, 12, 15, 19))
-            setPadding(0, dpi(8f), 0, dpi(8f))
-            isClickable = true
-        }
-        panelHeader = TextView(this).apply {
-            setTextColor(Color.WHITE); textSize = 16f
-            setPadding(dpi(14f), dpi(4f), dpi(14f), dpi(8f))
-            text = "Pilots"
-        }
-        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        header.addView(panelHeader, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(TextView(this).apply {
-            text = "⚙"; textSize = 22f; setTextColor(Color.rgb(200, 200, 200))
-            setPadding(dpi(14f), 0, dpi(14f), dpi(4f))
-            setOnClickListener { showSettings() }
-        })
-        panel.addView(header)
-        pilotRows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        panel.addView(ScrollView(this).apply { addView(pilotRows) }, LinearLayout.LayoutParams(-1, 0, 1f))
-        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dpi(8f), 0, dpi(8f), 0) }
-        buttons.addView(Button(this).apply {
-            text = "Rescan"; setOnClickListener { if (state == State.RUNNING) Native.scan() }
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        buttons.addView(Button(this).apply {
-            text = "USB test"; setOnClickListener { if (state == State.RUNNING) { mode = "usbtest"; startWork() } }
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        panel.addView(buttons)
-        root.addView(panel, FrameLayout.LayoutParams(0, -1, Gravity.END))
-
-        handle = TextView(this).apply {
-            text = "‹"; textSize = 28f; setTextColor(Color.argb(170, 255, 255, 255))
-            gravity = Gravity.CENTER
-            background = rounded(Color.argb(120, 0, 0, 0), 8f)
-            setOnClickListener { showPanel(true) }
-        }
-        root.addView(handle, FrameLayout.LayoutParams(dpi(28f), dpi(64f), Gravity.END or Gravity.CENTER_VERTICAL))
-
-        // tap: show the label (or hide the list); swipe in from the right edge: show the list
-        var downX = 0f; var downY = 0f
-        root.setOnTouchListener { v, e ->
+        // a tap on the picture: the MENU button, for three seconds
+        var downX = 0f
+        var downY = 0f
+        root.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y }
-                MotionEvent.ACTION_UP -> {
-                    val dx = e.x - downX; val dy = e.y - downY
-                    if (downX > v.width - dp(48f) && dx < -dp(60f) && abs(dy) < abs(dx)) showPanel(true)
-                    else if (abs(dx) < dp(10f) && abs(dy) < dp(10f)) {
-                        if (panelShown && state == State.RUNNING) showPanel(false)
-                        lastLabelTouch = System.currentTimeMillis()
-                        label.animate().alpha(1f).setDuration(150).start()
-                    }
-                }
+                MotionEvent.ACTION_UP -> if (!menuOpen && abs(e.x - downX) < dp(16f) && abs(e.y - downY) < dp(16f)) showHint()
             }
             true
         }
-        root.addOnLayoutChangeListener { _, _, _, r, _, _, _, oldR, _ -> if (r != oldR) layoutPanel() }
         setContentView(root)
-        setState(State.NO_ADAPTER)
     }
 
-    private fun prefs() = getSharedPreferences("settings", MODE_PRIVATE)
-
-    private fun showSettings() {
-        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(24f), dpi(12f), dpi(24f), 0) }
-        body.addView(Switch(this).apply {
-            text = "NTSC colour filter"; textSize = 17f
-            isChecked = prefs().getBoolean("comb", false)
-            setOnCheckedChangeListener { _, on ->
-                prefs().edit().putBoolean("comb", on).apply()
-                Native.setComb(on)
-                Native.log("settings: comb ${if (on) "on" else "off"}")
-                if (watchingHz > 0 && state == State.RUNNING) Native.watch(watchingHz)  // rebuilds the decoder
-            }
-        })
-        body.addView(TextView(this).apply {
-            text = "Fewer rainbow fringes on fine detail and OSD text. NTSC cameras only. Uses more CPU."
-            textSize = 13f; setTextColor(Color.rgb(170, 170, 170))
-            setPadding(0, dpi(4f), dpi(48f), 0)
-        })
-        AlertDialog.Builder(this)
-            .setTitle("Settings")
-            .setView(body)
-            .setPositiveButton("Done", null)
-            .setOnDismissListener { hideSystemBars() }
-            .show()
+    private val hideHint = Runnable {
+        hint.animate().alpha(0f).setDuration(450).withEndAction { hint.visibility = View.GONE }.start()
     }
 
-    private fun layoutPanel() {
-        val w = (root.width * 0.38f).toInt().coerceAtLeast(dpi(260f))
-        panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply { width = w }
-        panel.translationX = if (panelShown) 0f else w.toFloat()
-        handle.visibility = if (panelShown) View.GONE else View.VISIBLE
+    private fun showHint() {
+        ui.removeCallbacks(hideHint)
+        hint.animate().cancel()
+        hint.visibility = View.VISIBLE
+        hint.animate().alpha(1f).setDuration(140).start()
+        ui.postDelayed(hideHint, HINT_MS)
     }
 
-    private fun showPanel(show: Boolean) {
-        panelShown = show
-        val w = panel.width.toFloat().takeIf { it > 0 } ?: (root.width * 0.38f)
-        panel.animate().translationX(if (show) 0f else w).setDuration(220).start()
-        handle.visibility = if (show) View.GONE else View.VISIBLE
-        if (!show) lastLabelTouch = System.currentTimeMillis()
-        label.animate().alpha(1f).setDuration(150).start()
+    private fun openMenu() {
+        if (menuOpen) return
+        menuOpen = true
+        menuAuto = false
+        ui.removeCallbacks(hideHint)
+        hint.animate().cancel()
+        hint.alpha = 0f
+        hint.visibility = View.GONE
+        engine.setBackdrop(true, false)
+        refresh()
+        menu.animate().cancel()
+        menu.visibility = View.VISIBLE
+        menu.alpha = 0f
+        menu.translationY = dp(10f)
+        menu.animate().alpha(1f).translationY(0f).setDuration(240).setInterpolator(DecelerateInterpolator(1.5f)).withEndAction(null).start()
     }
 
-    private fun pilotRow(p: JSONObject, m: String): View {
-        val mhz = p.optDouble("mhz")
-        val selected = m == "watch" && abs(mhz * 1e6 - watchingHz) < 4e6
-        val snr = p.optDouble("snr")
-        val bars = when { snr >= 35 -> 4; snr >= 25 -> 3; snr >= 15 -> 2; else -> 1 }
-        val age = p.optLong("age_s")
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpi(14f), dpi(12f), dpi(14f), dpi(12f))
-            if (selected) setBackgroundColor(Color.rgb(20, 50, 77))
-            setOnClickListener {
-                Native.watch(mhz * 1e6)
-                watchingHz = mhz * 1e6
-                lastPilotsJson = ""
-                showPanel(false)
-            }
-        }
-        fun tv(t: String, size: Float, color: Int, w: Float) = TextView(this).apply {
-            text = t; textSize = size; setTextColor(color)
-        }.also { row.addView(it, LinearLayout.LayoutParams(if (w > 0) dpi(w) else 0, -2, if (w > 0) 0f else 1f)) }
-        tv(p.optString("name").ifEmpty { "—" }, 18f, Color.WHITE, 46f)
-        tv("%.0f MHz".format(mhz), 15f, Color.rgb(220, 220, 220), 86f)
-        tv(p.optString("std"), 12f, Color.rgb(170, 170, 170), 0f)
-        if (age > 15 && !selected) tv("${age}s ago", 11f, Color.rgb(140, 140, 140), 56f)
-        row.addView(signalBars(bars), LinearLayout.LayoutParams(dpi(30f), dpi(20f)))
-        return row
+    private fun closeMenu() {
+        if (!menuOpen) return
+        menuOpen = false
+        menuAuto = false
+        menu.endPeek()
+        engine.setBackdrop(false, false)
+        menu.animate().cancel()
+        menu.animate().alpha(0f).translationY(dp(10f)).setDuration(200).setInterpolator(DecelerateInterpolator(1.5f))
+            .withEndAction { menu.visibility = View.GONE }.start()
     }
 
-    /** Four rising bars, [n] of them lit. */
-    private fun signalBars(n: Int): View {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
-        for (i in 0 until 4) {
-            box.addView(View(this).apply {
-                setBackgroundColor(if (i < n) Color.rgb(76, 175, 80) else Color.rgb(58, 63, 69))
-            }, LinearLayout.LayoutParams(dpi(5f), dpi(5f + 5f * i)).apply { marginEnd = dpi(2.5f) })
-        }
-        return box
-    }
-
-    private fun rounded(color: Int, r: Float) = GradientDrawable().apply { setColor(color); cornerRadius = dp(r) }
-
+    /**
+     * The whole display, bars hidden, and laid out under a camera cutout too: the picture and the MENU button
+     * are centred on the screen itself (goggles need the two pictures either side of its middle), and the menu
+     * keeps clear of the cutout by its own padding.
+     */
     private fun hideSystemBars() {
-        window.insetsController?.let {
-            it.hide(WindowInsets.Type.systemBars())
-            it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {   // Android 10: the flags that came before the insets controller
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         }
     }
-}
 
-/** Keeps its child at a fixed aspect ratio, as large as fits. */
-class AspectFrame(ctx: Context, private val aspect: Float) : FrameLayout(ctx) {
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val w = MeasureSpec.getSize(widthMeasureSpec)
-        val h = MeasureSpec.getSize(heightMeasureSpec)
-        var cw = w
-        var ch = (w / aspect).toInt()
-        if (ch > h) { ch = h; cw = (h * aspect).toInt() }
-        super.onMeasure(MeasureSpec.makeMeasureSpec(cw, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(ch, MeasureSpec.EXACTLY))
+    companion object {
+        const val HINT_MS = 3000L
+        const val BACKGROUND_CLOSE_MS = 30000L
+        const val LATE_BLOCKS = 3
+        const val LATE_WINDOW_MS = 5000L
+        /** No refresh for longer than this (the poll runs every 250 ms): the late blocks counted meanwhile are not this watch's. */
+        const val LATE_GAP_MS = 2000L
+        const val OVERLOAD_ADVICE =
+            "The phone is not keeping up. Turn off Clean OSD edges, Colour comb or Diversity, or use sample rate 20."
+
+        /** The activity whose SurfaceView the native screen is drawing on, by its token (main thread only). */
+        private var surfaceOwner: Any? = null
+        /** Debug ("soak" extra): after every open, a 40 MS/s stream test of [SOAK_S] instead of a watch or scan. */
+        private var soak = false
+        const val SOAK_S = 600.0
     }
 }
